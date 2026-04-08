@@ -2,6 +2,13 @@
 
 :host {
   all: initial;
+  position: fixed !important;
+  top: 0 !important;
+  right: 0 !important;
+  width: 320px !important;
+  height: 100vh !important;
+  z-index: 2147483647 !important;
+  pointer-events: auto !important;
 }
 
 *, *::before, *::after {
@@ -188,6 +195,87 @@
   border-bottom: 1px solid #e2e8f0;
   margin-bottom: 4px;
   transition: color .2s, border-color .2s;
+}
+
+/* ---- MCP 服务器折叠分组 ---- */
+.mcp-server-group {
+  margin-bottom: 6px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  overflow: hidden;
+  transition: border-color .2s;
+}
+
+.mcp-server-group-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 8px;
+  background: #f8fafc;
+  cursor: default;
+  transition: background .15s;
+}
+
+.mcp-server-group-header:hover {
+  background: #eef2ff;
+}
+
+.mcp-server-check-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.mcp-server-checkbox {
+  width: 14px;
+  height: 14px;
+  accent-color: #4f46e5;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.mcp-server-group-name {
+  font-weight: 700;
+  font-size: 12px;
+  color: #1e293b;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: color .2s;
+}
+
+.mcp-server-group-meta {
+  font-size: 11px;
+  color: #94a3b8;
+  flex-shrink: 0;
+}
+
+.mcp-group-toggle {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 10px;
+  color: #94a3b8;
+  padding: 2px 4px;
+  border-radius: 3px;
+  flex-shrink: 0;
+  transition: color .15s, background .15s;
+  font-family: inherit;
+}
+
+.mcp-group-toggle:hover {
+  color: #4f46e5;
+  background: #e0e7ff;
+}
+
+.mcp-server-group-tools {
+  padding: 4px 6px 6px 6px;
+  border-top: 1px solid #e2e8f0;
+  background: #fff;
+  transition: border-color .2s;
 }
 
 .mcp-tool-item {
@@ -601,6 +689,41 @@
   color: #6c7086;
 }
 
+/* 深色模式 MCP 服务器折叠分组 */
+.mcp-sidebar.dark .mcp-server-group {
+  border-color: #313244;
+}
+
+.mcp-sidebar.dark .mcp-server-group-header {
+  background: #181825;
+}
+
+.mcp-sidebar.dark .mcp-server-group-header:hover {
+  background: #313244;
+}
+
+.mcp-sidebar.dark .mcp-server-group-name {
+  color: #cdd6f4;
+}
+
+.mcp-sidebar.dark .mcp-server-group-meta {
+  color: #585b70;
+}
+
+.mcp-sidebar.dark .mcp-group-toggle {
+  color: #6c7086;
+}
+
+.mcp-sidebar.dark .mcp-group-toggle:hover {
+  color: #89b4fa;
+  background: #313244;
+}
+
+.mcp-sidebar.dark .mcp-server-group-tools {
+  border-top-color: #313244;
+  background: #1e1e2e;
+}
+
 .mcp-sidebar.dark .mcp-call-card {
   background: #181825;
   border-color: #313244;
@@ -725,4 +848,103 @@
 
 .mcp-sidebar.dark ::-webkit-scrollbar-thumb:hover {
   background: #585b70;
+}
+
+/* ---- Skills 列表 ---- */
+.mcp-skill-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mcp-skill-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 8px;
+  border-radius: 5px;
+  border: 1px solid #e2e8f0;
+  background: #fff;
+  transition: background .1s, border-color .15s;
+  cursor: default;
+}
+
+.mcp-skill-item:hover {
+  background: #eef2ff;
+  border-color: #c7d2fe;
+}
+
+.mcp-skill-check-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.mcp-skill-checkbox {
+  width: 15px;
+  height: 15px;
+  accent-color: #4f46e5;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.mcp-skill-name {
+  font-weight: 600;
+  font-size: 12px;
+  color: #1e293b;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: color .2s;
+}
+
+.mcp-skill-meta {
+  font-size: 11px;
+  color: #94a3b8;
+  flex-shrink: 0;
+  margin-left: 6px;
+}
+
+.mcp-btn-danger {
+  background: #fff;
+  color: #dc2626;
+  border-color: #fca5a5;
+}
+
+.mcp-btn-danger:hover {
+  background: #fef2f2;
+  border-color: #dc2626;
+}
+
+/* Skills 深色模式 */
+.mcp-sidebar.dark .mcp-skill-item {
+  background: #181825;
+  border-color: #313244;
+}
+
+.mcp-sidebar.dark .mcp-skill-item:hover {
+  background: #313244;
+  border-color: #45475a;
+}
+
+.mcp-sidebar.dark .mcp-skill-name {
+  color: #cdd6f4;
+}
+
+.mcp-sidebar.dark .mcp-skill-meta {
+  color: #585b70;
+}
+
+.mcp-sidebar.dark .mcp-btn-danger {
+  background: #1e1e2e;
+  color: #f38ba8;
+  border-color: #45475a;
+}
+
+.mcp-sidebar.dark .mcp-btn-danger:hover {
+  background: #313244;
+  border-color: #f38ba8;
 }

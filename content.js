@@ -78,6 +78,7 @@
 
   // ==================== 状态 ====================
   let allTools = [];
+  let selectedServers = new Set(); // 已选中的 MCP 服务器名称
   let autoExecute = false;
   let autoSubmit = false;
   let pasteIntercept = true;
@@ -274,6 +275,7 @@
       <div class="mcp-tabs">
         <button class="mcp-tab active" data-tab="tools">工具</button>
         <button class="mcp-tab" data-tab="calls">调用</button>
+        <button class="mcp-tab" data-tab="skills">Skills</button>
         <button class="mcp-tab" data-tab="settings">设置</button>
       </div>
 
@@ -284,7 +286,11 @@
             <button class="mcp-btn mcp-btn-flex" id="mcpDownloadPrompt">下载 .md</button>
             <button class="mcp-btn mcp-btn-flex" id="mcpCopyPrompt">复制</button>
           </div>
-          <button class="mcp-btn mcp-btn-full" id="mcpRefreshTools">刷新工具列表</button>
+          <div class="mcp-actions-row">
+            <button class="mcp-btn mcp-btn-full mcp-btn-flex" id="mcpRefreshTools">刷新工具列表</button>
+            <button class="mcp-btn mcp-btn-flex" id="mcpSelectAllServers">全选</button>
+            <button class="mcp-btn mcp-btn-flex" id="mcpClearServers">清除</button>
+          </div>
         </div>
         <div class="mcp-tool-list" id="mcpToolList">
           <div class="mcp-empty">暂无可用工具。请通过扩展弹窗添加 MCP 服务器。</div>
@@ -294,6 +300,20 @@
       <div class="mcp-tab-content" id="mcpTabCalls">
         <div class="mcp-call-list" id="mcpCallList">
           <div class="mcp-empty">尚未检测到工具调用。</div>
+        </div>
+      </div>
+
+      <div class="mcp-tab-content" id="mcpTabSkills">
+        <div class="mcp-actions-col">
+          <div class="mcp-actions-row">
+            <button class="mcp-btn mcp-btn-primary mcp-btn-flex" id="mcpImportSkillFolder">导入文件夹</button>
+            <button class="mcp-btn mcp-btn-flex" id="mcpInjectSkills">注入选中</button>
+            <button class="mcp-btn mcp-btn-flex mcp-btn-danger" id="mcpDeleteSkill">删除</button>
+          </div>
+          <input type="file" id="mcpSkillFolderInput" webkitdirectory multiple style="display:none" />
+        </div>
+        <div class="mcp-skill-list" id="mcpSkillList">
+          <div class="mcp-empty">暂无 Skills。点击上方按钮导入文件夹。</div>
         </div>
       </div>
 
@@ -334,6 +354,149 @@
     `;
   }
 
+  // ==================== Skills 管理 ====================
+  // skill 结构: { id, name, files: [{name, content}] }
+  let skills = [];
+
+  async function loadSkills() {
+    try {
+      const result = await chrome.storage.local.get('mcp_skills');
+      skills = result.mcp_skills || [];
+    } catch (e) {
+      console.warn('[MCP] 加载 skills 失败:', e);
+      skills = [];
+    }
+  }
+
+  function saveSkills() {
+    try {
+      chrome.storage.local.set({ mcp_skills: skills });
+    } catch (e) {
+      console.warn('[MCP] 保存 skills 失败:', e);
+    }
+  }
+
+  function addSkillFolder(folderName, files) {
+    // 如果同名文件夹已存在则覆盖
+    const existing = skills.findIndex(s => s.name === folderName);
+    const skill = { id: Date.now().toString(), name: folderName, files };
+    if (existing >= 0) {
+      skills[existing] = skill;
+    } else {
+      skills.push(skill);
+    }
+    saveSkills();
+    renderSkillList();
+  }
+
+  function removeSkillById(id) {
+    skills = skills.filter(s => s.id !== id);
+    saveSkills();
+    renderSkillList();
+  }
+
+  function buildSkillMarkdown(skill) {
+    // 将文件夹内所有文件拼接为一个 .md 内容
+    const lines = [`# Skill: ${skill.name}`, ''];
+    for (const f of skill.files) {
+      lines.push(`## ${f.name}`, '');
+      lines.push(f.content);
+      lines.push('');
+    }
+    return lines.join('\n');
+  }
+
+  function renderSkillList() {
+    if (!shadowRoot) return;
+    const list = shadowRoot.querySelector('#mcpSkillList');
+    if (!list) return;
+
+    if (skills.length === 0) {
+      list.innerHTML = '<div class="mcp-empty">暂无 Skills。点击上方按钮导入文件夹。</div>';
+      return;
+    }
+
+    list.innerHTML = skills.map(s => `
+      <div class="mcp-skill-item" data-id="${s.id}">
+        <label class="mcp-skill-check-label">
+          <input type="checkbox" class="mcp-skill-checkbox" data-id="${s.id}" />
+          <span class="mcp-skill-name">${s.name}</span>
+        </label>
+        <span class="mcp-skill-meta">${s.files.length} 个文件</span>
+      </div>
+    `).join('');
+  }
+
+  function getSelectedSkillIds() {
+    if (!shadowRoot) return [];
+    return [...shadowRoot.querySelectorAll('.mcp-skill-checkbox:checked')].map(cb => cb.dataset.id);
+  }
+
+  async function injectSelectedSkills() {
+    const selectedIds = getSelectedSkillIds();
+    if (selectedIds.length === 0) {
+      showNotification('请先勾选要注入的 Skill');
+      return;
+    }
+    const selected = skills.filter(s => selectedIds.includes(s.id));
+    // 拼接所有选中的 skills 为一个 .md 内容
+    const combined = selected.map(s => buildSkillMarkdown(s)).join('\n---\n\n');
+    const mimeType = PLATFORM === 'gemini' ? 'text/plain' : 'text/markdown';
+    const fileName = selected.length === 1
+      ? `skill-${selected[0].name}.md`
+      : `skills-combined-${Date.now()}.md`;
+    const file = new File([combined], fileName, { type: mimeType, lastModified: Date.now() });
+
+    let attached = false;
+
+    if (PLATFORM === 'gemini') {
+      try {
+        attached = await geminiDropFile(file);
+      } catch (e) {
+        console.warn('[MCP] Skill 注入（拖放）失败:', e);
+      }
+    }
+
+    if (!attached) {
+      const fileInput = await findFileInputWithRetry();
+      if (fileInput) {
+        try {
+          const dt = new DataTransfer();
+          dt.items.add(file);
+          fileInput.files = dt.files;
+          fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+          fileInput.dispatchEvent(new Event('input', { bubbles: true }));
+          attached = true;
+        } catch (e) {
+          console.warn('[MCP] Skill 注入（fileInput）失败:', e);
+        }
+      }
+    }
+
+    if (!attached) {
+      const dropZone = getDropZone();
+      if (dropZone) {
+        try {
+          const dt = new DataTransfer();
+          dt.items.add(file);
+          dropZone.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: dt }));
+          dropZone.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt }));
+          dropZone.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
+          attached = true;
+        } catch (e) {
+          console.warn('[MCP] Skill 注入（dragEvent）失败:', e);
+        }
+      }
+    }
+
+    if (attached) {
+      const names = selected.map(s => s.name).join(', ');
+      showNotification(`Skill(s) [${names}] 已注入为 .md 文件`);
+    } else {
+      showNotification('Skill 注入失败，请手动操作');
+    }
+  }
+
   // ==================== 侧边栏逻辑 ====================
   let shadowRoot = null;
   let sidebarEventsBound = false;
@@ -354,6 +517,9 @@
     // 加载自动设置偏好
     loadSettingsPreferences();
 
+    // 加载 Skills
+    loadSkills().then(() => renderSkillList());
+
     // Gemini: 注入拖放监听器到页面主世界（用于文件上传）
     injectGeminiDragDropListener();
   }
@@ -373,6 +539,7 @@
         const target = tab.dataset.tab;
         if (target === 'tools') $('#mcpTabTools').classList.add('active');
         else if (target === 'calls') $('#mcpTabCalls').classList.add('active');
+        else if (target === 'skills') $('#mcpTabSkills').classList.add('active');
         else if (target === 'settings') $('#mcpTabSettings').classList.add('active');
       });
     });
@@ -384,6 +551,76 @@
 
     // 刷新工具
     $('#mcpRefreshTools')?.addEventListener('click', () => refreshTools());
+
+    // 全选/清除服务器
+    $('#mcpSelectAllServers')?.addEventListener('click', () => {
+      const grouped = {};
+      for (const t of allTools) {
+        const key = t.serverName || t.serverId || 'Default';
+        grouped[key] = true;
+      }
+      selectedServers = new Set(Object.keys(grouped));
+      renderToolList();
+    });
+    $('#mcpClearServers')?.addEventListener('click', () => {
+      selectedServers = new Set();
+      renderToolList();
+    });
+
+    // Skills 事件
+    $('#mcpImportSkillFolder')?.addEventListener('click', () => {
+      $('#mcpSkillFolderInput')?.click();
+    });
+
+    $('#mcpSkillFolderInput')?.addEventListener('change', (e) => {
+      const fileList = Array.from(e.target.files || []);
+      if (fileList.length === 0) return;
+
+      // 取文件夹名（所有文件的 webkitRelativePath 第一段相同）
+      const folderName = fileList[0].webkitRelativePath.split('/')[0] || 'unknown';
+
+      // 读取所有文件内容
+      let pending = fileList.length;
+      const fileEntries = [];
+
+      fileList.forEach(file => {
+        const reader = new FileReader();
+        const relativePath = file.webkitRelativePath.split('/').slice(1).join('/') || file.name;
+        reader.onload = () => {
+          fileEntries.push({ name: relativePath, content: reader.result });
+          pending--;
+          if (pending === 0) {
+            // 按路径名排序
+            fileEntries.sort((a, b) => a.name.localeCompare(b.name));
+            addSkillFolder(folderName, fileEntries);
+            showNotification(`Skill "${folderName}" 已导入（${fileEntries.length} 个文件）`);
+          }
+        };
+        reader.onerror = () => {
+          pending--;
+          if (pending === 0 && fileEntries.length > 0) {
+            fileEntries.sort((a, b) => a.name.localeCompare(b.name));
+            addSkillFolder(folderName, fileEntries);
+            showNotification(`Skill "${folderName}" 已导入（${fileEntries.length} 个文件，部分读取失败）`);
+          }
+        };
+        reader.readAsText(file);
+      });
+
+      e.target.value = '';
+    });
+
+    $('#mcpInjectSkills')?.addEventListener('click', () => injectSelectedSkills());
+
+    $('#mcpDeleteSkill')?.addEventListener('click', () => {
+      const selectedIds = getSelectedSkillIds();
+      if (selectedIds.length === 0) {
+        showNotification('请先勾选要删除的 Skill');
+        return;
+      }
+      selectedIds.forEach(id => removeSkillById(id));
+      showNotification(`已删除 ${selectedIds.length} 个 Skill`);
+    });
 
     // 自动设置（持久化到 chrome.storage.local）
     $('#mcpAutoExecute')?.addEventListener('change', (e) => {
@@ -486,6 +723,12 @@
       allTools = [];
       console.warn('[MCP] 获取工具失败:', e.message);
     }
+    // 刷新工具后默认全选所有服务器
+    selectedServers = new Set();
+    for (const t of allTools) {
+      const key = t.serverName || t.serverId || 'Default';
+      selectedServers.add(key);
+    }
     renderToolList();
   }
 
@@ -514,24 +757,57 @@
     // 按服务器分组
     const grouped = {};
     for (const t of allTools) {
-      const key = t.serverName || t.serverId;
+      const key = t.serverName || t.serverId || 'Default';
       if (!grouped[key]) grouped[key] = [];
       grouped[key].push(t);
     }
 
     let html = '';
     for (const [serverName, tools] of Object.entries(grouped)) {
-      html += `<div class="mcp-tool-group">
-        <div class="mcp-tool-group-header">${esc(serverName)} (${tools.length} 个工具)</div>`;
+      const checked = selectedServers.has(serverName) ? 'checked' : '';
+      html += `
+        <div class="mcp-server-group">
+          <div class="mcp-server-group-header">
+            <label class="mcp-server-check-label">
+              <input type="checkbox" class="mcp-server-checkbox" data-server="${esc(serverName)}" ${checked} />
+              <span class="mcp-server-group-name">${esc(serverName)}</span>
+            </label>
+            <span class="mcp-server-group-meta">${tools.length} 个工具</span>
+            <button class="mcp-group-toggle" data-server="${esc(serverName)}" title="展开/收起">▶</button>
+          </div>
+          <div class="mcp-server-group-tools" data-server="${esc(serverName)}" style="display:none">`;
       for (const t of tools) {
         html += `<div class="mcp-tool-item" title="${esc(t.description || '')}">
           <span class="mcp-tool-name">${esc(t.name)}</span>
           <span class="mcp-tool-desc">${esc(truncate(t.description || '', 60))}</span>
         </div>`;
       }
-      html += '</div>';
+      html += `</div></div>`;
     }
     container.innerHTML = html;
+
+    // 绑定展开/收起
+    container.querySelectorAll('.mcp-group-toggle').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const server = btn.dataset.server;
+        const toolsEl = container.querySelector(`.mcp-server-group-tools[data-server="${server}"]`);
+        if (!toolsEl) return;
+        const isOpen = toolsEl.style.display !== 'none';
+        toolsEl.style.display = isOpen ? 'none' : 'block';
+        btn.textContent = isOpen ? '▶' : '▼';
+      });
+    });
+
+    // 绑定 checkbox 选中
+    container.querySelectorAll('.mcp-server-checkbox').forEach(cb => {
+      cb.addEventListener('change', () => {
+        if (cb.checked) {
+          selectedServers.add(cb.dataset.server);
+        } else {
+          selectedServers.delete(cb.dataset.server);
+        }
+      });
+    });
   }
 
   function renderServerList(servers) {
@@ -1042,6 +1318,36 @@
     // 区分成功和失败
     const hasErrors = results.some((r) => r.error !== null);
     const hasSuccesses = results.some((r) => r.result !== null);
+    const toolNames = results.map((r) => r.call.name).join(', ');
+
+    // 粘贴拦截关闭时，直接以纯文本注入，不创建 .md 文件
+    if (!pasteIntercept) {
+      console.log('[MCP] pasteIntercept=OFF, 批量结果以纯文本注入');
+      const combinedBlocks = results.map(({ call, result, error }) => {
+        const contentText = error
+          ? `ERROR: ${error.message}\n\nParameters used:\n${JSON.stringify(call.params, null, 2)}\n\nPlease analyze the error, fix the parameters, and retry this tool call.`
+          : formatResult(result);
+        return [
+          '```jsonl',
+          JSON.stringify({ type: 'function_result_start', call_id: call.callId }),
+          JSON.stringify({ type: 'content', text: contentText }),
+          JSON.stringify({ type: 'function_result_end', call_id: call.callId }),
+          '```',
+        ].join('\n');
+      }).join('\n\n');
+
+      if (hasErrors) {
+        setInputValue(`MCP tool calls [${toolNames}] encountered errors. Please analyze and retry:\n\n${combinedBlocks}`);
+      } else {
+        setInputValue(`Here are the results of the MCP tool calls [${toolNames}]:\n\n${combinedBlocks}`);
+      }
+
+      if (autoSubmit) {
+        console.log('[MCP][auto-send] autoSubmit=true, calling clickSendButtonWithRetry()');
+        clickSendButtonWithRetry();
+      }
+      return;
+    }
 
     // 构建合并的 .md 内容（同时支持成功结果和错误报告）
     const blocks = results.map(({ call, result, error }) => {
@@ -1143,7 +1449,6 @@
       }
     }
 
-    const toolNames = results.map((r) => r.call.name).join(', ');
     if (attached) {
       if (hasErrors && hasSuccesses) {
         setInputValue(`The results of MCP tools [${toolNames}] are attached as a .md file. Some tools returned errors. Please read the attachment, analyze the errors, fix the parameters, and retry the failed tools.`);
@@ -1210,6 +1515,14 @@
       JSON.stringify({ type: 'function_result_end', call_id: call.callId }),
       '```',
     ].join('\n');
+
+    // 粘贴拦截关闭时，直接以纯文本注入，不创建 .md 文件
+    if (!pasteIntercept) {
+      console.log('[MCP] pasteIntercept=OFF, 直接以纯文本注入结果');
+      const fullText = `Here is the result of the MCP tool call "${call.name}":\n\n${block}`;
+      setInputValue(fullText);
+      return;
+    }
 
     const fullMdContent = `# MCP Tool Result: ${call.name}\n\n${block}`;
     const file = createResultFile(call, fullMdContent);
@@ -1288,13 +1601,19 @@
 
   // ==================== MCP 提示词生成 ====================
   function generateMCPPrompt() {
-    if (allTools.length === 0) {
-      return '(No MCP tools available. Please connect to MCP servers first.)';
+    // 只处理已选服务器的工具
+    const selectedTools = allTools.filter(t => {
+      const key = t.serverName || 'Default';
+      return selectedServers.has(key);
+    });
+
+    if (selectedTools.length === 0) {
+      return '(No MCP tools selected. Please select servers in the Tools tab.)';
     }
 
     // 按服务器分组
     const grouped = {};
-    for (const t of allTools) {
+    for (const t of selectedTools) {
       const key = t.serverName || 'Default';
       if (!grouped[key]) grouped[key] = [];
       grouped[key].push(t);
@@ -1478,8 +1797,8 @@ IMPORTANT: Function calls must be placed in a proper \`\`\`jsonl\`\`\` code bloc
   }
 
   async function attachMCPPromptFile() {
-    if (allTools.length === 0) {
-      showNotification('暂无可用工具，请先连接 MCP 服务器。');
+    if (selectedServers.size === 0) {
+      showNotification('请先在工具栏勾选至少一个 MCP 服务器。');
       return;
     }
 
@@ -1552,8 +1871,8 @@ IMPORTANT: Function calls must be placed in a proper \`\`\`jsonl\`\`\` code bloc
   }
 
   function downloadMCPPrompt() {
-    if (allTools.length === 0) {
-      showNotification('暂无可用工具，请先连接 MCP 服务器。');
+    if (selectedServers.size === 0) {
+      showNotification('请先在工具栏勾选至少一个 MCP 服务器。');
       return;
     }
 
@@ -1570,8 +1889,8 @@ IMPORTANT: Function calls must be placed in a proper \`\`\`jsonl\`\`\` code bloc
   }
 
   async function copyMCPPrompt() {
-    if (allTools.length === 0) {
-      showNotification('暂无可用工具，请先连接 MCP 服务器。');
+    if (selectedServers.size === 0) {
+      showNotification('请先在工具栏勾选至少一个 MCP 服务器。');
       return;
     }
 
@@ -1969,7 +2288,7 @@ IMPORTANT: Function calls must be placed in a proper \`\`\`jsonl\`\`\` code bloc
       t.classList.toggle('active', t.dataset.tab === name);
     });
     shadowRoot.querySelectorAll('.mcp-tab-content').forEach((c) => c.classList.remove('active'));
-    const map = { tools: 'mcpTabTools', calls: 'mcpTabCalls', settings: 'mcpTabSettings' };
+    const map = { tools: 'mcpTabTools', calls: 'mcpTabCalls', skills: 'mcpTabSkills', settings: 'mcpTabSettings' };
     shadowRoot.querySelector(`#${map[name]}`)?.classList.add('active');
   }
 
