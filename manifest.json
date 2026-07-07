@@ -60,7 +60,7 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["sidebar.css", "dragDropListener.js"],
+      "resources": ["dragDropListener.js"],
       "matches": ["<all_urls>"]
     }
   ]

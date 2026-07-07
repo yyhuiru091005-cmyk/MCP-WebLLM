@@ -1,5 +1,7 @@
 // content.js — MCP Multi Bridge 内容脚本
-// 注入到 AI 聊天页面，提供侧边栏 UI、工具调用检测、执行和结果注入。
+// 职责：只留"一只手"——在 AI 网页里注入文本/文件、检测 AI 输出的工具调用、执行并回注结果。
+// 不再渲染任何面板 UI（UI 已迁至 sidePanel）；网页内仅保留低调的行内状态标。
+// 与 sidePanel 的通信：chrome.tabs.sendMessage（指令进）+ chrome.runtime.sendMessage（状态广播出）。
 
 'use strict';
 
@@ -44,7 +46,7 @@
   }
   ensureKeepalive();
 
-  // ==================== 消息通信 ====================
+  // ==================== 消息通信（→ background MCP 层） ====================
   function send(msg) {
     return new Promise((resolve, reject) => {
       chrome.runtime.sendMessage(msg, (resp) => {
@@ -76,16 +78,45 @@
     throw lastError;
   }
 
-  // ==================== 状态 ====================
-  let allTools = [];
-  let selectedServers = new Set(); // 已选中的 MCP 服务器名称
-  let autoExecute = false;
-  let autoSubmit = false;
+  // ==================== 状态广播（→ sidePanel 时间线） ====================
+  function reportStatus(event, extra = {}) {
+    try {
+      const p = chrome.runtime.sendMessage({ type: 'mcpStatus', event, ...extra });
+      if (p && p.catch) p.catch(() => { });
+    } catch (_) { /* 扩展上下文失效等，忽略 */ }
+  }
+
+  // ==================== 设置（chrome.storage 共享，sidePanel 修改 → 此处热更新） ====================
+  let autoExecute = true;   // 一步式体验默认开启
+  let autoSubmit = true;
   let pasteIntercept = true;
   let autoSendDelay = 4;   // 秒：最后一个MCP返回后等待多久再注入（等待AI继续输出新调用）
   let fileParsDelay = 8;   // 秒：注入文件后等待多久再发送（等待平台解析文件）
-  let sidebarVisible = false;
-  let darkMode = false;
+
+  function loadSettings() {
+    chrome.storage?.local?.get(
+      ['mcpAutoExecute', 'mcpAutoSubmit', 'mcpPasteIntercept', 'mcpAutoSendDelay', 'mcpFileParsDelay'],
+      (result) => {
+        if (!result) return;
+        if (result.mcpAutoExecute !== undefined) autoExecute = result.mcpAutoExecute;
+        if (result.mcpAutoSubmit !== undefined) autoSubmit = result.mcpAutoSubmit;
+        if (result.mcpPasteIntercept !== undefined) pasteIntercept = result.mcpPasteIntercept;
+        if (result.mcpAutoSendDelay !== undefined) autoSendDelay = result.mcpAutoSendDelay;
+        if (result.mcpFileParsDelay !== undefined) fileParsDelay = result.mcpFileParsDelay;
+      },
+    );
+  }
+
+  chrome.storage?.onChanged?.addListener((changes, area) => {
+    if (area !== 'local') return;
+    if (changes.mcpAutoExecute) autoExecute = changes.mcpAutoExecute.newValue;
+    if (changes.mcpAutoSubmit) autoSubmit = changes.mcpAutoSubmit.newValue;
+    if (changes.mcpPasteIntercept) pasteIntercept = changes.mcpPasteIntercept.newValue;
+    if (changes.mcpAutoSendDelay) autoSendDelay = changes.mcpAutoSendDelay.newValue;
+    if (changes.mcpFileParsDelay) fileParsDelay = changes.mcpFileParsDelay.newValue;
+  });
+
+  // ==================== 检测/执行状态 ====================
   const processedBlocks = new WeakMap(); // element → 已处理的调用数量（支持流式增量检测）
   // Gemini 专用：基于内容签名的去重集合
   // Gemini 在流式输出时会销毁并重建 <code> 元素，导致 WeakMap 丢失引用
@@ -96,13 +127,16 @@
   // 当同一批检测到多个工具调用时，收集所有结果后再统一注入+发送
   let pendingExecutions = 0;
   let collectedResults = []; // { call, result, error }
-  let batchInjectTimer = null;
 
   // ==================== 跨周期累积 & 统一计时器 ====================
-  // 跨扫描周期累积的所有已完成结果（等最后一个调用完成后 8s 再统一注入）
+  // 跨扫描周期累积的所有已完成结果（等最后一个调用完成后 N 秒再统一注入）
   let accumulatedResults = [];
-  let autoSendTimer = null; // 8 秒自动发送定时器 ID
-  let sendRetryTimer = null; // 1 秒发送延迟定时器 ID（可取消，防止调用未完成就发送）
+  let autoSendTimer = null; // 自动发送定时器 ID
+  let sendRetryTimer = null; // 发送延迟定时器 ID（可取消，防止调用未完成就发送）
+
+  // ==================== 调用注册表（供 sidePanel 手动执行/重试） ====================
+  let callSeq = 0;
+  const callRegistry = new Map(); // callKey → { call, chip, status }
 
   // ==================== Gemini 拖放监听器注入 ====================
   let geminiDragDropInjected = false;
@@ -159,13 +193,13 @@
           fileData: reader.result, // base64 data URL
         }, '*');
         // 给平台时间处理拖放事件，然后检查文件预览元素
-            setTimeout(() => {
-              const preview = document.querySelector('.file-preview, .xap-filed-upload-preview, .attachment-preview');
-              if (preview) {
-                console.log('[MCP] 文件预览已出现，附件成功');
-              } else {
-                console.warn('[MCP] 文件预览未出现，但仍视为成功（乐观模式）');
-              }
+        setTimeout(() => {
+          const preview = document.querySelector('.file-preview, .xap-filed-upload-preview, .attachment-preview');
+          if (preview) {
+            console.log('[MCP] 文件预览已出现，附件成功');
+          } else {
+            console.warn('[MCP] 文件预览未出现，但仍视为成功（乐观模式）');
+          }
           resolve(true);
         }, 800);
       };
@@ -193,15 +227,8 @@
 
   function onConversationSwitch() {
     console.log('[MCP] 检测到会话切换，暂停自动执行 3 秒');
-    // 设置 3 秒抑制窗口：在此期间扫描到的工具调用只创建卡片，不自动执行
+    // 设置 3 秒抑制窗口：在此期间扫描到的工具调用不自动执行
     suppressAutoExecuteUntil = Date.now() + 3000;
-
-    // 清空旧会话的调用卡片列表（旧会话的调用卡片在新会话中无意义）
-    const callList = shadowRoot?.querySelector('#mcpCallList');
-    if (callList) {
-      callList.innerHTML = '<div class="mcp-empty">尚未检测到工具调用。</div>';
-    }
-    callIdCounter = 0;
 
     // 清理跨周期累积状态 & 取消待发送的自动发送定时器
     clearTimeout(autoSendTimer);
@@ -209,624 +236,10 @@
     clearTimeout(sendRetryTimer);
     sendRetryTimer = null;
     accumulatedResults = [];
-    // Gemini: 清空签名去重集合，新会话重新开始
+    // 清空签名去重集合与调用注册表，新会话重新开始
     processedCallSignatures.clear();
-  }
-
-  // ==================== 侧边栏创建 ====================
-  function createSidebar() {
-    const host = document.createElement('div');
-    host.id = 'mcp-multi-bridge-host';
-    host.style.display = 'none'; // 默认收起
-    document.body.appendChild(host);
-
-    const shadow = host.attachShadow({ mode: 'open' });
-
-    // 加载样式
-    const link = document.createElement('link');
-    link.rel = 'stylesheet';
-    link.href = chrome.runtime.getURL('sidebar.css');
-    shadow.appendChild(link);
-
-    const sidebar = document.createElement('div');
-    sidebar.className = 'mcp-sidebar';
-    sidebar.innerHTML = buildSidebarHTML();
-    shadow.appendChild(sidebar);
-
-    // 切换按钮（放在 shadow 外部保证可见）
-    const toggle = document.createElement('div');
-    toggle.id = 'mcp-multi-bridge-toggle';
-    toggle.title = 'MCP Multi Bridge';
-    toggle.textContent = 'MCP';
-    toggle.classList.add('collapsed'); // 默认收起状态
-    toggle.addEventListener('click', (e) => {
-      e.stopPropagation(); // 防止 document click 立即收起
-      sidebarVisible = !sidebarVisible;
-      host.style.display = sidebarVisible ? 'block' : 'none';
-      toggle.classList.toggle('collapsed', !sidebarVisible);
-    });
-    document.body.appendChild(toggle);
-
-    // 点击侧边栏外部区域时收起
-    host.addEventListener('click', (e) => {
-      e.stopPropagation(); // 点击侧边栏内部不收起
-    });
-    document.addEventListener('click', () => {
-      if (sidebarVisible) {
-        sidebarVisible = false;
-        host.style.display = 'none';
-        toggle.classList.add('collapsed');
-      }
-    });
-
-    return { host, shadow, sidebar };
-  }
-
-  function buildSidebarHTML() {
-    return `
-      <div class="mcp-header">
-        <span class="mcp-title">MCP Multi Bridge</span>
-        <div class="mcp-header-right">
-          <span class="mcp-server-count" id="mcpServerCount">0 个服务器</span>
-          <button class="mcp-theme-btn" id="mcpThemeToggle" title="切换到深色模式">深色</button>
-        </div>
-      </div>
-
-      <div class="mcp-tabs">
-        <button class="mcp-tab active" data-tab="tools">工具</button>
-        <button class="mcp-tab" data-tab="calls">调用</button>
-        <button class="mcp-tab" data-tab="skills">Skills</button>
-        <button class="mcp-tab" data-tab="settings">设置</button>
-      </div>
-
-      <div class="mcp-tab-content active" id="mcpTabTools">
-        <div class="mcp-actions-col">
-          <div class="mcp-actions-row">
-            <button class="mcp-btn mcp-btn-primary mcp-btn-flex" id="mcpAttachPrompt">附加 .md</button>
-            <button class="mcp-btn mcp-btn-flex" id="mcpDownloadPrompt">下载 .md</button>
-            <button class="mcp-btn mcp-btn-flex" id="mcpCopyPrompt">复制</button>
-          </div>
-          <div class="mcp-actions-row">
-            <button class="mcp-btn mcp-btn-full mcp-btn-flex" id="mcpRefreshTools">刷新工具列表</button>
-            <button class="mcp-btn mcp-btn-flex" id="mcpSelectAllServers">全选</button>
-            <button class="mcp-btn mcp-btn-flex" id="mcpClearServers">清除</button>
-          </div>
-        </div>
-        <div class="mcp-tool-list" id="mcpToolList">
-          <div class="mcp-empty">暂无可用工具。请通过扩展弹窗添加 MCP 服务器。</div>
-        </div>
-      </div>
-
-      <div class="mcp-tab-content" id="mcpTabCalls">
-        <div class="mcp-call-list" id="mcpCallList">
-          <div class="mcp-empty">尚未检测到工具调用。</div>
-        </div>
-      </div>
-
-      <div class="mcp-tab-content" id="mcpTabSkills">
-        <div class="mcp-actions-col">
-          <div class="mcp-actions-row">
-            <button class="mcp-btn mcp-btn-primary mcp-btn-flex" id="mcpImportSkillFolder">导入文件夹</button>
-            <button class="mcp-btn mcp-btn-flex" id="mcpInjectSkills">注入选中</button>
-            <button class="mcp-btn mcp-btn-flex mcp-btn-danger" id="mcpDeleteSkill">删除</button>
-          </div>
-          <input type="file" id="mcpSkillFolderInput" webkitdirectory multiple style="display:none" />
-        </div>
-        <div class="mcp-skill-list" id="mcpSkillList">
-          <div class="mcp-empty">暂无 Skills。点击上方按钮导入文件夹。</div>
-        </div>
-      </div>
-
-      <div class="mcp-tab-content" id="mcpTabSettings">
-        <label class="mcp-toggle-row">
-          <input type="checkbox" id="mcpAutoExecute" />
-          <span>自动执行工具调用</span>
-        </label>
-        <label class="mcp-toggle-row">
-          <input type="checkbox" id="mcpAutoSubmit" />
-          <span>注入结果后自动发送</span>
-        </label>
-        <label class="mcp-toggle-row">
-          <input type="checkbox" id="mcpPasteIntercept" checked />
-          <span>粘贴拦截（MCP结果→文件附件）</span>
-        </label>
-        <div class="mcp-delay-row">
-          <label for="mcpAutoSendDelay">等待注入延迟</label>
-          <div class="mcp-delay-input-wrap">
-            <input type="number" id="mcpAutoSendDelay" min="1" max="30" value="4" />
-            <span class="mcp-delay-unit">秒</span>
-          </div>
-          <span class="mcp-delay-hint">最后一个调用完成后等待新调用的时间</span>
-        </div>
-        <div class="mcp-delay-row">
-          <label for="mcpFileParsDelay">发送前延迟</label>
-          <div class="mcp-delay-input-wrap">
-            <input type="number" id="mcpFileParsDelay" min="1" max="30" value="8" />
-            <span class="mcp-delay-unit">秒</span>
-          </div>
-          <span class="mcp-delay-hint">注入文件后等待平台解析再发送</span>
-        </div>
-        <hr class="mcp-divider" />
-        <div class="mcp-section-title">已连接的服务器</div>
-        <div id="mcpServerList" class="mcp-server-list"></div>
-        <p class="mcp-hint">请通过扩展弹窗管理服务器（点击工具栏图标）。</p>
-      </div>
-    `;
-  }
-
-  // ==================== Skills 管理 ====================
-  // skill 结构: { id, name, files: [{name, content}] }
-  let skills = [];
-
-  async function loadSkills() {
-    try {
-      const result = await chrome.storage.local.get('mcp_skills');
-      skills = result.mcp_skills || [];
-    } catch (e) {
-      console.warn('[MCP] 加载 skills 失败:', e);
-      skills = [];
-    }
-  }
-
-  function saveSkills() {
-    try {
-      chrome.storage.local.set({ mcp_skills: skills });
-    } catch (e) {
-      console.warn('[MCP] 保存 skills 失败:', e);
-    }
-  }
-
-  function addSkillFolder(folderName, files) {
-    // 如果同名文件夹已存在则覆盖
-    const existing = skills.findIndex(s => s.name === folderName);
-    const skill = { id: Date.now().toString(), name: folderName, files };
-    if (existing >= 0) {
-      skills[existing] = skill;
-    } else {
-      skills.push(skill);
-    }
-    saveSkills();
-    renderSkillList();
-  }
-
-  function removeSkillById(id) {
-    skills = skills.filter(s => s.id !== id);
-    saveSkills();
-    renderSkillList();
-  }
-
-  function buildSkillMarkdown(skill) {
-    // 将文件夹内所有文件拼接为一个 .md 内容
-    const lines = [`# Skill: ${skill.name}`, ''];
-    for (const f of skill.files) {
-      lines.push(`## ${f.name}`, '');
-      lines.push(f.content);
-      lines.push('');
-    }
-    return lines.join('\n');
-  }
-
-  function renderSkillList() {
-    if (!shadowRoot) return;
-    const list = shadowRoot.querySelector('#mcpSkillList');
-    if (!list) return;
-
-    if (skills.length === 0) {
-      list.innerHTML = '<div class="mcp-empty">暂无 Skills。点击上方按钮导入文件夹。</div>';
-      return;
-    }
-
-    list.innerHTML = skills.map(s => `
-      <div class="mcp-skill-item" data-id="${s.id}">
-        <label class="mcp-skill-check-label">
-          <input type="checkbox" class="mcp-skill-checkbox" data-id="${s.id}" />
-          <span class="mcp-skill-name">${s.name}</span>
-        </label>
-        <span class="mcp-skill-meta">${s.files.length} 个文件</span>
-      </div>
-    `).join('');
-  }
-
-  function getSelectedSkillIds() {
-    if (!shadowRoot) return [];
-    return [...shadowRoot.querySelectorAll('.mcp-skill-checkbox:checked')].map(cb => cb.dataset.id);
-  }
-
-  async function injectSelectedSkills() {
-    const selectedIds = getSelectedSkillIds();
-    if (selectedIds.length === 0) {
-      showNotification('请先勾选要注入的 Skill');
-      return;
-    }
-    const selected = skills.filter(s => selectedIds.includes(s.id));
-    // 拼接所有选中的 skills 为一个 .md 内容
-    const combined = selected.map(s => buildSkillMarkdown(s)).join('\n---\n\n');
-    const mimeType = PLATFORM === 'gemini' ? 'text/plain' : 'text/markdown';
-    const fileName = selected.length === 1
-      ? `skill-${selected[0].name}.md`
-      : `skills-combined-${Date.now()}.md`;
-    const file = new File([combined], fileName, { type: mimeType, lastModified: Date.now() });
-
-    let attached = false;
-
-    if (PLATFORM === 'gemini') {
-      try {
-        attached = await geminiDropFile(file);
-      } catch (e) {
-        console.warn('[MCP] Skill 注入（拖放）失败:', e);
-      }
-    }
-
-    if (!attached) {
-      const fileInput = await findFileInputWithRetry();
-      if (fileInput) {
-        try {
-          const dt = new DataTransfer();
-          dt.items.add(file);
-          fileInput.files = dt.files;
-          fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-          fileInput.dispatchEvent(new Event('input', { bubbles: true }));
-          attached = true;
-        } catch (e) {
-          console.warn('[MCP] Skill 注入（fileInput）失败:', e);
-        }
-      }
-    }
-
-    if (!attached) {
-      const dropZone = getDropZone();
-      if (dropZone) {
-        try {
-          const dt = new DataTransfer();
-          dt.items.add(file);
-          dropZone.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: dt }));
-          dropZone.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt }));
-          dropZone.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
-          attached = true;
-        } catch (e) {
-          console.warn('[MCP] Skill 注入（dragEvent）失败:', e);
-        }
-      }
-    }
-
-    if (attached) {
-      const names = selected.map(s => s.name).join(', ');
-      showNotification(`Skill(s) [${names}] 已注入为 .md 文件`);
-    } else {
-      showNotification('Skill 注入失败，请手动操作');
-    }
-  }
-
-  // ==================== 侧边栏逻辑 ====================
-  let shadowRoot = null;
-  let sidebarEventsBound = false;
-
-  function initSidebar() {
-    const { shadow, sidebar } = createSidebar();
-    shadowRoot = shadow;
-
-    // 等待样式表加载完成后绑定事件
-    const linkEl = shadow.querySelector('link');
-    linkEl.addEventListener('load', () => bindSidebarEvents());
-    // 回退：如果 load 事件不触发（缓存），延迟绑定
-    setTimeout(() => bindSidebarEvents(), 200);
-
-    // 加载深色模式偏好
-    loadDarkModePreference();
-
-    // 加载自动设置偏好
-    loadSettingsPreferences();
-
-    // 加载 Skills
-    loadSkills().then(() => renderSkillList());
-
-    // Gemini: 注入拖放监听器到页面主世界（用于文件上传）
-    injectGeminiDragDropListener();
-  }
-
-  function bindSidebarEvents() {
-    if (!shadowRoot || sidebarEventsBound) return;
-    sidebarEventsBound = true;
-    const $ = (sel) => shadowRoot.querySelector(sel);
-    const $$ = (sel) => shadowRoot.querySelectorAll(sel);
-
-    // 标签页切换
-    $$('.mcp-tab').forEach((tab) => {
-      tab.addEventListener('click', () => {
-        $$('.mcp-tab').forEach((t) => t.classList.remove('active'));
-        $$('.mcp-tab-content').forEach((c) => c.classList.remove('active'));
-        tab.classList.add('active');
-        const target = tab.dataset.tab;
-        if (target === 'tools') $('#mcpTabTools').classList.add('active');
-        else if (target === 'calls') $('#mcpTabCalls').classList.add('active');
-        else if (target === 'skills') $('#mcpTabSkills').classList.add('active');
-        else if (target === 'settings') $('#mcpTabSettings').classList.add('active');
-      });
-    });
-
-    // 提示词操作
-    $('#mcpAttachPrompt')?.addEventListener('click', () => attachMCPPromptFile());
-    $('#mcpDownloadPrompt')?.addEventListener('click', () => downloadMCPPrompt());
-    $('#mcpCopyPrompt')?.addEventListener('click', () => copyMCPPrompt());
-
-    // 刷新工具
-    $('#mcpRefreshTools')?.addEventListener('click', () => refreshTools());
-
-    // 全选/清除服务器
-    $('#mcpSelectAllServers')?.addEventListener('click', () => {
-      const grouped = {};
-      for (const t of allTools) {
-        const key = t.serverName || t.serverId || 'Default';
-        grouped[key] = true;
-      }
-      selectedServers = new Set(Object.keys(grouped));
-      renderToolList();
-    });
-    $('#mcpClearServers')?.addEventListener('click', () => {
-      selectedServers = new Set();
-      renderToolList();
-    });
-
-    // Skills 事件
-    $('#mcpImportSkillFolder')?.addEventListener('click', () => {
-      $('#mcpSkillFolderInput')?.click();
-    });
-
-    $('#mcpSkillFolderInput')?.addEventListener('change', (e) => {
-      const fileList = Array.from(e.target.files || []);
-      if (fileList.length === 0) return;
-
-      // 取文件夹名（所有文件的 webkitRelativePath 第一段相同）
-      const folderName = fileList[0].webkitRelativePath.split('/')[0] || 'unknown';
-
-      // 读取所有文件内容
-      let pending = fileList.length;
-      const fileEntries = [];
-
-      fileList.forEach(file => {
-        const reader = new FileReader();
-        const relativePath = file.webkitRelativePath.split('/').slice(1).join('/') || file.name;
-        reader.onload = () => {
-          fileEntries.push({ name: relativePath, content: reader.result });
-          pending--;
-          if (pending === 0) {
-            // 按路径名排序
-            fileEntries.sort((a, b) => a.name.localeCompare(b.name));
-            addSkillFolder(folderName, fileEntries);
-            showNotification(`Skill "${folderName}" 已导入（${fileEntries.length} 个文件）`);
-          }
-        };
-        reader.onerror = () => {
-          pending--;
-          if (pending === 0 && fileEntries.length > 0) {
-            fileEntries.sort((a, b) => a.name.localeCompare(b.name));
-            addSkillFolder(folderName, fileEntries);
-            showNotification(`Skill "${folderName}" 已导入（${fileEntries.length} 个文件，部分读取失败）`);
-          }
-        };
-        reader.readAsText(file);
-      });
-
-      e.target.value = '';
-    });
-
-    $('#mcpInjectSkills')?.addEventListener('click', () => injectSelectedSkills());
-
-    $('#mcpDeleteSkill')?.addEventListener('click', () => {
-      const selectedIds = getSelectedSkillIds();
-      if (selectedIds.length === 0) {
-        showNotification('请先勾选要删除的 Skill');
-        return;
-      }
-      selectedIds.forEach(id => removeSkillById(id));
-      showNotification(`已删除 ${selectedIds.length} 个 Skill`);
-    });
-
-    // 自动设置（持久化到 chrome.storage.local）
-    $('#mcpAutoExecute')?.addEventListener('change', (e) => {
-      autoExecute = e.target.checked;
-      chrome.storage?.local?.set({ mcpAutoExecute: autoExecute });
-    });
-    $('#mcpAutoSubmit')?.addEventListener('change', (e) => {
-      autoSubmit = e.target.checked;
-      chrome.storage?.local?.set({ mcpAutoSubmit: autoSubmit });
-    });
-    $('#mcpPasteIntercept')?.addEventListener('change', (e) => {
-      pasteIntercept = e.target.checked;
-      chrome.storage?.local?.set({ mcpPasteIntercept: pasteIntercept });
-    });
-    $('#mcpAutoSendDelay')?.addEventListener('change', (e) => {
-      autoSendDelay = Math.max(1, Math.min(30, parseInt(e.target.value) || 4));
-      e.target.value = autoSendDelay;
-      chrome.storage?.local?.set({ mcpAutoSendDelay: autoSendDelay });
-    });
-    $('#mcpFileParsDelay')?.addEventListener('change', (e) => {
-      fileParsDelay = Math.max(1, Math.min(30, parseInt(e.target.value) || 8));
-      e.target.value = fileParsDelay;
-      chrome.storage?.local?.set({ mcpFileParsDelay: fileParsDelay });
-    });
-
-    // 主题切换
-    $('#mcpThemeToggle')?.addEventListener('click', () => toggleDarkMode());
-
-    // 初始加载
-    refreshTools();
-    refreshServers();
-  }
-
-  // ==================== 深色模式 ====================
-  function loadDarkModePreference() {
-    chrome.storage?.local?.get(['mcpDarkMode'], (result) => {
-      if (result && result.mcpDarkMode) {
-        darkMode = true;
-        applyDarkMode();
-      }
-    });
-  }
-
-  // ==================== 设置持久化 ====================
-  function loadSettingsPreferences() {
-    chrome.storage?.local?.get(['mcpAutoExecute', 'mcpAutoSubmit', 'mcpPasteIntercept', 'mcpAutoSendDelay', 'mcpFileParsDelay'], (result) => {
-      if (!result) return;
-      if (result.mcpAutoExecute !== undefined) {
-        autoExecute = result.mcpAutoExecute;
-        const el = shadowRoot?.querySelector('#mcpAutoExecute');
-        if (el) el.checked = autoExecute;
-      }
-      if (result.mcpAutoSubmit !== undefined) {
-        autoSubmit = result.mcpAutoSubmit;
-        const el = shadowRoot?.querySelector('#mcpAutoSubmit');
-        if (el) el.checked = autoSubmit;
-      }
-      if (result.mcpPasteIntercept !== undefined) {
-        pasteIntercept = result.mcpPasteIntercept;
-        const el = shadowRoot?.querySelector('#mcpPasteIntercept');
-        if (el) el.checked = pasteIntercept;
-      }
-      if (result.mcpAutoSendDelay !== undefined) {
-        autoSendDelay = result.mcpAutoSendDelay;
-        const el = shadowRoot?.querySelector('#mcpAutoSendDelay');
-        if (el) el.value = autoSendDelay;
-      }
-      if (result.mcpFileParsDelay !== undefined) {
-        fileParsDelay = result.mcpFileParsDelay;
-        const el = shadowRoot?.querySelector('#mcpFileParsDelay');
-        if (el) el.value = fileParsDelay;
-      }
-    });
-  }
-
-  function toggleDarkMode() {
-    darkMode = !darkMode;
-    applyDarkMode();
-    chrome.storage?.local?.set({ mcpDarkMode: darkMode });
-  }
-
-  function applyDarkMode() {
-    if (!shadowRoot) return;
-    const sidebar = shadowRoot.querySelector('.mcp-sidebar');
-    const btn = shadowRoot.querySelector('#mcpThemeToggle');
-    if (sidebar) {
-      sidebar.classList.toggle('dark', darkMode);
-    }
-    if (btn) {
-      btn.textContent = darkMode ? '浅色' : '深色';
-      btn.title = darkMode ? '切换到浅色模式' : '切换到深色模式';
-    }
-  }
-
-  // ==================== 刷新数据 ====================
-  async function refreshTools() {
-    try {
-      allTools = await send({ type: 'getTools' });
-    } catch (e) {
-      allTools = [];
-      console.warn('[MCP] 获取工具失败:', e.message);
-    }
-    // 刷新工具后默认全选所有服务器
-    selectedServers = new Set();
-    for (const t of allTools) {
-      const key = t.serverName || t.serverId || 'Default';
-      selectedServers.add(key);
-    }
-    renderToolList();
-  }
-
-  async function refreshServers() {
-    try {
-      const servers = await send({ type: 'getServers' });
-      renderServerList(servers);
-      const connected = servers.filter((s) => s.status === 'connected').length;
-      const total = servers.length;
-      const countEl = shadowRoot?.querySelector('#mcpServerCount');
-      if (countEl) countEl.textContent = `${connected}/${total} 已连接`;
-    } catch (e) {
-      console.warn('[MCP] 获取服务器信息失败:', e.message);
-    }
-  }
-
-  // ==================== 渲染辅助 ====================
-  function renderToolList() {
-    const container = shadowRoot?.querySelector('#mcpToolList');
-    if (!container) return;
-    if (allTools.length === 0) {
-      container.innerHTML = '<div class="mcp-empty">暂无可用工具。请通过扩展弹窗添加 MCP 服务器。</div>';
-      return;
-    }
-
-    // 按服务器分组
-    const grouped = {};
-    for (const t of allTools) {
-      const key = t.serverName || t.serverId || 'Default';
-      if (!grouped[key]) grouped[key] = [];
-      grouped[key].push(t);
-    }
-
-    let html = '';
-    for (const [serverName, tools] of Object.entries(grouped)) {
-      const checked = selectedServers.has(serverName) ? 'checked' : '';
-      html += `
-        <div class="mcp-server-group">
-          <div class="mcp-server-group-header">
-            <label class="mcp-server-check-label">
-              <input type="checkbox" class="mcp-server-checkbox" data-server="${esc(serverName)}" ${checked} />
-              <span class="mcp-server-group-name">${esc(serverName)}</span>
-            </label>
-            <span class="mcp-server-group-meta">${tools.length} 个工具</span>
-            <button class="mcp-group-toggle" data-server="${esc(serverName)}" title="展开/收起">▶</button>
-          </div>
-          <div class="mcp-server-group-tools" data-server="${esc(serverName)}" style="display:none">`;
-      for (const t of tools) {
-        html += `<div class="mcp-tool-item" title="${esc(t.description || '')}">
-          <span class="mcp-tool-name">${esc(t.name)}</span>
-          <span class="mcp-tool-desc">${esc(truncate(t.description || '', 60))}</span>
-        </div>`;
-      }
-      html += `</div></div>`;
-    }
-    container.innerHTML = html;
-
-    // 绑定展开/收起
-    container.querySelectorAll('.mcp-group-toggle').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const server = btn.dataset.server;
-        const toolsEl = container.querySelector(`.mcp-server-group-tools[data-server="${server}"]`);
-        if (!toolsEl) return;
-        const isOpen = toolsEl.style.display !== 'none';
-        toolsEl.style.display = isOpen ? 'none' : 'block';
-        btn.textContent = isOpen ? '▶' : '▼';
-      });
-    });
-
-    // 绑定 checkbox 选中
-    container.querySelectorAll('.mcp-server-checkbox').forEach(cb => {
-      cb.addEventListener('change', () => {
-        if (cb.checked) {
-          selectedServers.add(cb.dataset.server);
-        } else {
-          selectedServers.delete(cb.dataset.server);
-        }
-      });
-    });
-  }
-
-  function renderServerList(servers) {
-    const container = shadowRoot?.querySelector('#mcpServerList');
-    if (!container) return;
-    if (servers.length === 0) {
-      container.innerHTML = '<div class="mcp-empty">暂无已配置的服务器。</div>';
-      return;
-    }
-    let html = '';
-    for (const s of servers) {
-      const dot = s.status === 'connected' ? 'connected' : 'disconnected';
-      html += `<div class="mcp-server-row">
-        <span class="mcp-status-dot ${dot}"></span>
-        <span class="mcp-server-name">${esc(s.name)}</span>
-        <span class="mcp-server-tools">${s.toolCount || 0} 个工具</span>
-      </div>`;
-    }
-    container.innerHTML = html;
+    callRegistry.clear();
+    reportStatus('conversation_switch');
   }
 
   // ==================== 工具调用检测 ====================
@@ -905,7 +318,7 @@
             if (processedCallSignatures.has(sig)) continue;
             processedCallSignatures.add(sig);
           }
-          addToolCallCard(call, block);
+          registerToolCall(call, block);
         }
       }
     }
@@ -946,7 +359,7 @@
             const sig = `${call.name}|${call.callId}|${JSON.stringify(call.params)}`;
             if (processedCallSignatures.has(sig)) continue;
             processedCallSignatures.add(sig);
-            addToolCallCard(call, el);
+            registerToolCall(call, el);
           }
         }
       }
@@ -1069,122 +482,81 @@
     return objects;
   }
 
-  // ==================== 工具调用卡片 ====================
-  let callIdCounter = 0;
+  // ==================== 调用注册 + 行内状态标（低调版） ====================
+  function registerToolCall(call, codeBlock) {
+    const callKey = String(++callSeq);
+    const entry = { call, chip: null, status: 'waiting' };
+    callRegistry.set(callKey, entry);
 
-  function addToolCallCard(call, codeBlock) {
-    const cardId = `mcp-call-${++callIdCounter}`;
+    entry.chip = injectInlineChip(call, codeBlock, callKey);
 
-    const callList = shadowRoot?.querySelector('#mcpCallList');
-    if (callList) {
-      const empty = callList.querySelector('.mcp-empty');
-      if (empty) empty.remove();
+    const willAutoRun = autoExecute && Date.now() > suppressAutoExecuteUntil;
+    reportStatus('call_detected', {
+      callKey,
+      name: call.name,
+      detail: truncate(JSON.stringify(call.params), 100),
+      needsManualRun: !willAutoRun,
+    });
 
-      const card = document.createElement('div');
-      card.className = 'mcp-call-card';
-      card.id = cardId;
-      card.innerHTML = `
-        <div class="mcp-call-header">
-          <span class="mcp-call-name">${esc(call.name)}</span>
-          <span class="mcp-call-id">#${call.callId}</span>
-        </div>
-        ${call.description ? `<div class="mcp-call-desc">${esc(call.description)}</div>` : ''}
-        <div class="mcp-call-params">
-          ${Object.entries(call.params).map(([k, v]) =>
-        `<div class="mcp-param"><span class="mcp-param-key">${esc(k)}:</span> <span class="mcp-param-val">${esc(stringify(v))}</span></div>`
-      ).join('')}
-        </div>
-        <div class="mcp-call-actions">
-          <button class="mcp-btn mcp-btn-run" data-card="${cardId}">执行</button>
-          <button class="mcp-btn mcp-btn-copy-result" data-card="${cardId}" style="display:none;">复制结果</button>
-          <span class="mcp-call-status">等待中</span>
-        </div>
-        <div class="mcp-call-result" style="display:none;"></div>
-      `;
-      callList.prepend(card);
+    if (willAutoRun) {
+      executeToolCall(callKey, true);
+    }
+  }
 
-      card.querySelector('.mcp-btn-run').addEventListener('click', () => {
-        executeToolCall(call, card, false);
-      });
+  /** 低调的行内状态标：⚙ 正在调用 xxx… → ✓ 已调用；不自动执行时显示执行按钮 */
+  function injectInlineChip(call, codeBlock, callKey) {
+    const chip = document.createElement('div');
+    chip.className = 'mcp-chip';
+    chip.innerHTML = `<span class="mcp-chip-icon"></span><span class="mcp-chip-text"></span>`;
 
-      if (autoExecute && Date.now() > suppressAutoExecuteUntil) {
-        executeToolCall(call, card, true);
-      }
+    setChip(chip, 'waiting', `检测到工具调用 ${call.name}`);
+    const willAutoRun = autoExecute && Date.now() > suppressAutoExecuteUntil;
+    if (!willAutoRun) {
+      appendChipButton(chip, '执行', callKey);
     }
 
-    injectInlineIndicator(call, codeBlock);
-    switchTab('calls');
-  }
-
-  function injectInlineIndicator(call, codeBlock) {
-    const indicator = document.createElement('div');
-    indicator.className = 'mcp-inline-indicator';
-    indicator.innerHTML = `
-      <span style="font-weight:600;color:#4f46e5;">MCP 工具调用:</span>
-      <span>${esc(call.name)}</span>
-      <button class="mcp-inline-run" data-tool="${esc(call.name)}" data-call-id="${call.callId}">执行</button>
-    `;
-
     const pre = codeBlock.closest('pre') || codeBlock;
-    pre.parentNode?.insertBefore(indicator, pre.nextSibling);
-
-    indicator.querySelector('.mcp-inline-run')?.addEventListener('click', async (e) => {
-      const btn = e.target;
-      btn.disabled = true;
-      btn.textContent = '执行中...';
-      try {
-        const result = await sendWithRetry(
-          { type: 'callTool', toolName: call.name, arguments: call.params },
-          (attempt, max) => { btn.textContent = `重试中 (${attempt}/${max})...`; }
-        );
-        btn.textContent = '完成';
-        btn.classList.add('done');
-        await injectResult(call, result);
-        if (autoSubmit) {
-          clickSendButtonWithRetry();
-        }
-      } catch (err) {
-        btn.textContent = '失败';
-        btn.classList.add('error');
-        btn.disabled = false;
-        btn.addEventListener('click', async () => {
-          btn.disabled = true;
-          btn.textContent = '执行中...';
-          try {
-            const result = await sendWithRetry(
-              { type: 'callTool', toolName: call.name, arguments: call.params },
-              (attempt, max) => { btn.textContent = `重试中 (${attempt}/${max})...`; }
-            );
-            btn.textContent = '完成';
-            btn.classList.add('done');
-            btn.classList.remove('error');
-            await injectResult(call, result);
-            if (autoSubmit) {
-              clickSendButtonWithRetry();
-            }
-          } catch (err2) {
-            btn.textContent = '失败';
-            btn.disabled = false;
-          }
-        }, { once: true });
-        console.error('[MCP] 工具调用错误:', err);
-      }
-    });
+    pre.parentNode?.insertBefore(chip, pre.nextSibling);
+    return chip;
   }
 
-  async function executeToolCall(call, card, isBatch = false) {
-    const statusEl = card.querySelector('.mcp-call-status');
-    const resultEl = card.querySelector('.mcp-call-result');
-    const btn = card.querySelector('.mcp-btn-run');
+  function setChip(chip, state, text) {
+    if (!chip) return;
+    chip.classList.remove('waiting', 'running', 'done', 'error');
+    chip.classList.add(state);
+    const icons = { waiting: '·', running: '⚙', done: '✓', error: '✕' };
+    const iconEl = chip.querySelector('.mcp-chip-icon');
+    const textEl = chip.querySelector('.mcp-chip-text');
+    if (iconEl) iconEl.textContent = icons[state] || '·';
+    if (textEl) textEl.textContent = text;
+  }
 
-    statusEl.textContent = '执行中...';
-    statusEl.className = 'mcp-call-status running';
-    btn.disabled = true;
+  function appendChipButton(chip, label, callKey) {
+    chip.querySelector('.mcp-chip-btn')?.remove();
+    const btn = document.createElement('button');
+    btn.className = 'mcp-chip-btn';
+    btn.textContent = label;
+    btn.addEventListener('click', () => {
+      btn.remove();
+      executeToolCall(callKey, false);
+    });
+    chip.appendChild(btn);
+  }
+
+  // ==================== 工具执行（批量编排逻辑保持原样） ====================
+  async function executeToolCall(callKey, isBatch = false) {
+    const entry = callRegistry.get(callKey);
+    if (!entry || entry.status === 'running') return;
+    const { call, chip } = entry;
+
+    entry.status = 'running';
+    setChip(chip, 'running', `正在调用 ${call.name}…`);
+    reportStatus('call_running', { callKey, name: call.name });
 
     if (isBatch) {
       pendingExecutions++;
       console.log(`[MCP][auto-send] executeToolCall START: ${call.name}#${call.callId}, pendingExecutions=${pendingExecutions}`);
-      // 新的调用开始 → 取消已有的 8s 定时器和 1s 发送定时器
+      // 新的调用开始 → 取消已有的自动发送定时器和发送延迟定时器
       // 确保在所有调用完成前不会提前发送
       clearTimeout(autoSendTimer);
       autoSendTimer = null;
@@ -1195,33 +567,34 @@
     try {
       const result = await sendWithRetry(
         { type: 'callTool', toolName: call.name, arguments: call.params },
-        (attempt, max, err) => {
-          statusEl.textContent = `重试中 (${attempt}/${max}): ${err.message}`;
+        (attempt, max) => {
+          setChip(chip, 'running', `重试中 (${attempt}/${max})：${call.name}`);
         }
       );
 
-      statusEl.textContent = '已完成';
-      statusEl.className = 'mcp-call-status completed';
-      btn.textContent = '完成';
-
-      const resultText = formatResult(result);
-      resultEl.style.display = 'block';
-      resultEl.textContent = truncate(resultText, 500);
-
-      // 显示"复制结果"按钮
-      showCopyResultButton(card, call, result);
+      entry.status = 'done';
+      setChip(chip, 'done', `已调用 ${call.name}`);
+      reportStatus('call_done', {
+        callKey,
+        name: call.name,
+        detail: truncate(formatResult(result), 120),
+      });
 
       if (isBatch) {
         collectedResults.push({ call, result, error: null });
       } else {
-        // 单次手动执行：直接注入（不自动发送，由 inline indicator 或手动触发）
+        // 手动执行：直接注入，并按设置自动发送
         await injectResult(call, result);
+        if (autoSubmit) {
+          clickSendButtonWithRetry();
+        }
       }
     } catch (e) {
-      statusEl.textContent = `失败 (已重试${MAX_RETRIES}次): ${e.message}`;
-      statusEl.className = 'mcp-call-status error';
-      btn.textContent = '重试';
-      btn.disabled = false;
+      entry.status = 'error';
+      setChip(chip, 'error', `调用失败：${call.name}`);
+      appendChipButton(chip, '重试', callKey);
+      reportStatus('call_error', { callKey, name: call.name, detail: e.message });
+      console.error('[MCP] 工具调用错误:', e);
 
       if (isBatch) {
         collectedResults.push({ call, result: null, error: e });
@@ -1233,40 +606,6 @@
         onBatchExecutionComplete();
       }
     }
-  }
-
-  function showCopyResultButton(card, call, result) {
-    const copyBtn = card.querySelector('.mcp-btn-copy-result');
-    if (!copyBtn) return;
-    copyBtn.style.display = 'inline-block';
-    copyBtn.addEventListener('click', async () => {
-      const resultText = formatResult(result);
-      const block = [
-        '```jsonl',
-        JSON.stringify({ type: 'function_result_start', call_id: call.callId }),
-        JSON.stringify({ type: 'content', text: resultText }),
-        JSON.stringify({ type: 'function_result_end', call_id: call.callId }),
-        '```',
-      ].join('\n');
-      const fullContent = `Here is the result of the MCP tool call "${call.name}":\n\n${block}`;
-
-      try {
-        await navigator.clipboard.writeText(fullContent);
-        copyBtn.textContent = '已复制';
-        setTimeout(() => { copyBtn.textContent = '复制结果'; }, 2000);
-      } catch (e) {
-        // 回退：使用 textarea + execCommand
-        const ta = document.createElement('textarea');
-        ta.value = fullContent;
-        ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px;';
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        copyBtn.textContent = '已复制';
-        setTimeout(() => { copyBtn.textContent = '复制结果'; }, 2000);
-      }
-    }, { once: false });
   }
 
   function onBatchExecutionComplete() {
@@ -1290,9 +629,9 @@
     // 清空本轮收集的结果（已转移到 accumulatedResults）
     collectedResults = [];
 
-    // 取消之前的 8s 定时器，重新开始计时
+    // 取消之前的定时器，重新开始计时
     // 这样如果后续还有新的工具调用完成，会再次重置定时器
-    // 最终效果：最后一个 MCP 返回后 8s 才发送
+    // 最终效果：最后一个 MCP 返回后 N 秒才发送
     clearTimeout(autoSendTimer);
     autoSendTimer = null;
 
@@ -1342,6 +681,7 @@
         setInputValue(`Here are the results of the MCP tool calls [${toolNames}]:\n\n${combinedBlocks}`);
       }
 
+      reportStatus('results_injected', { detail: toolNames });
       if (autoSubmit) {
         console.log('[MCP][auto-send] autoSubmit=true, calling clickSendButtonWithRetry()');
         clickSendButtonWithRetry();
@@ -1479,6 +819,7 @@
       }
     }
 
+    reportStatus('results_injected', { detail: toolNames });
     if (autoSubmit) {
       console.log('[MCP][auto-send] autoSubmit=true, calling clickSendButtonWithRetry()');
       clickSendButtonWithRetry();
@@ -1521,6 +862,7 @@
       console.log('[MCP] pasteIntercept=OFF, 直接以纯文本注入结果');
       const fullText = `Here is the result of the MCP tool call "${call.name}":\n\n${block}`;
       setInputValue(fullText);
+      reportStatus('results_injected', { detail: call.name });
       return;
     }
 
@@ -1596,224 +938,19 @@
       const fullText = `Here is the result of the MCP tool call "${call.name}":\n\n${block}`;
       setInputValue(fullText);
     }
-    // 注意: autoSubmit 逻辑已移至 injectBatchResults() 和 inline indicator 处理
+    reportStatus('results_injected', { detail: call.name });
+    // 注意: autoSubmit 逻辑由调用方（injectBatchResults / 手动执行路径）处理
   }
 
-  // ==================== MCP 提示词生成 ====================
-  function generateMCPPrompt() {
-    // 只处理已选服务器的工具
-    const selectedTools = allTools.filter(t => {
-      const key = t.serverName || 'Default';
-      return selectedServers.has(key);
-    });
-
-    if (selectedTools.length === 0) {
-      return '(No MCP tools selected. Please select servers in the Tools tab.)';
-    }
-
-    // 按服务器分组
-    const grouped = {};
-    for (const t of selectedTools) {
-      const key = t.serverName || 'Default';
-      if (!grouped[key]) grouped[key] = [];
-      grouped[key].push(t);
-    }
-
-    // 生成工具列表部分
-    let toolSection = '';
-    for (const [server, tools] of Object.entries(grouped)) {
-      toolSection += `### Server: ${server}\n\n`;
-      for (const t of tools) {
-        toolSection += `- **${t.name}**`;
-        if (t.description) toolSection += ` — ${t.description}`;
-        toolSection += '\n';
-        if (t.inputSchema && t.inputSchema.properties) {
-          const props = t.inputSchema.properties;
-          const required = t.inputSchema.required || [];
-          toolSection += '  Parameters:\n';
-          for (const [pName, pSchema] of Object.entries(props)) {
-            const req = required.includes(pName) ? ' (required)' : ' (optional)';
-            const type = pSchema.type || 'any';
-            const desc = pSchema.description || '';
-            toolSection += `    - \`${pName}\` (${type}${req}): ${desc}\n`;
-          }
-        }
-        toolSection += '\n';
-      }
-    }
-
-    const prompt = `[MCP Bridge Operational Instructions][IMPORTANT]
-
-<system>
-
-You are an AI assistant with access to external MCP (Model Context Protocol) tools. You MUST actively use these tools to help the user accomplish tasks. When a user's request can be fulfilled or enhanced by using available tools, you SHOULD proactively invoke the appropriate tool rather than attempting to answer from memory alone.
-
-Your job is to analyze the user's request, determine which tool(s) to use, output the function call in the exact format specified below, and then WAIT for the execution result before continuing.
-
-## Function Call Format
-
-All function calls MUST be wrapped in a \`\`\`jsonl\`\`\` code block on a NEW LINE. This is a strict requirement.
-
-<example_function_call>
-
-\`\`\`jsonl
-{"type": "function_call_start", "name": "function_name", "call_id": 1}
-{"type": "description", "text": "Brief description of what this function call does"}
-{"type": "parameter", "key": "param_1", "value": "value_1"}
-{"type": "parameter", "key": "param_2", "value": "value_2"}
-{"type": "function_call_end", "call_id": 1}
-\`\`\`
-
-</example_function_call>
-
-<example_multi_call>
-
-When tasks are independent and parallelizable, you can make multiple calls at once. IMPORTANT: Each call MUST be in its OWN SEPARATE \`\`\`jsonl\`\`\` code block. Do NOT put multiple calls in the same code block.
-
-\`\`\`jsonl
-{"type": "function_call_start", "name": "tool_a", "call_id": 1}
-{"type": "description", "text": "First independent task"}
-{"type": "parameter", "key": "param_1", "value": "value_1"}
-{"type": "function_call_end", "call_id": 1}
-\`\`\`
-
-\`\`\`jsonl
-{"type": "function_call_start", "name": "tool_b", "call_id": 2}
-{"type": "description", "text": "Second independent task"}
-{"type": "parameter", "key": "param_1", "value": "value_2"}
-{"type": "function_call_end", "call_id": 2}
-\`\`\`
-
-</example_multi_call>
-
-## Rules for Function Calls
-
-1. ALWAYS analyze what function calls would be appropriate for the user's task.
-2. ALWAYS format your function call EXACTLY as specified above — JSON Lines inside a \`\`\`jsonl\`\`\` code block.
-3. Each function call MUST have a unique \`call_id\` (integer, starting from 1, incrementing by 1).
-4. Include ALL required parameters. Do NOT make up values for optional parameters — only include them when needed.
-5. Parameter values MUST be valid JSON values (strings in quotes, numbers without quotes, booleans as true/false, arrays as [...], objects as {...}).
-6. You MAY invoke multiple function calls in a single response when the calls are independent and can be executed in parallel. Each call must have a unique \`call_id\`. **CRITICAL: Each call MUST be in its own SEPARATE \`\`\`jsonl\`\`\` code block.** Do NOT combine multiple calls into one code block — the detection system processes each code block independently, so merging them will cause calls to be missed. If the calls depend on each other (e.g., the second call needs the result of the first), make them in separate responses.
-7. After outputting a function call, STOP immediately. Do NOT continue writing. Wait for the execution result.
-8. NEVER fabricate, simulate, or guess function results. You MUST wait for the actual execution result provided by the user.
-9. Do NOT refer to tool names when speaking to the user — focus on what you are doing, not which tool you are using.
-10. When you receive a function result, analyze it and either provide the final answer or make the next function call as needed.
-
-## Function Result Format
-
-After a function is executed, the result will be provided in this format:
-
-\`\`\`jsonl
-{"type": "function_result_start", "call_id": 1}
-{"type": "content", "text": "result content here"}
-{"type": "function_result_end", "call_id": 1}
-\`\`\`
-
-## Response Format
-
-When you need to use a tool, structure your response like this:
-
-1. First, briefly explain your reasoning — what the user is asking, and why you are choosing this tool.
-2. Then output the function call in the exact \`\`\`jsonl\`\`\` format.
-3. STOP. Do not write anything after the function call code block.
-
-## Agent Mode
-
-You support an **Agent Mode** that can be activated by the user. When the user says phrases like "enter agent mode", "agent mode", "进入agent模式", "自主模式", "agentic mode", or similar instructions, you MUST switch to Agent Mode and follow these rules:
-
-### Agent Mode Behavior
-
-In Agent Mode, you act as an **autonomous agent** that proactively and iteratively uses tools to accomplish the user's goal. You do NOT stop after a single tool call — instead, you operate in a continuous loop:
-
-1. **Analyze** the user's request and break it down into steps.
-2. **Call** the appropriate tool(s) to begin working on the task.
-3. **Receive** the tool result and **evaluate** whether the result is satisfactory and whether the task is complete.
-4. **If NOT complete**: explain what you learned, what is still missing or unsatisfactory, and immediately make the next tool call. Do NOT ask the user for permission to continue — just keep going.
-5. **If complete**: provide a comprehensive summary of everything you did, the results obtained, and any conclusions or recommendations.
-
-### Agent Mode Rules
-
-1. **Be proactive**: Do not wait for the user to tell you the next step. Decide on your own what tool to call next based on the results you have received so far.
-2. **Be persistent**: If a tool call returns an error or unsatisfactory result, try a different approach, adjust parameters, or use a different tool. Do not give up after one failure.
-3. **Be iterative**: Keep calling tools in a loop until the task is fully accomplished. Each response should contain either a tool call (to continue working) or a final summary (when done).
-4. **Explain your reasoning**: Before each tool call, briefly explain what you learned from the previous result and why you are making the next call.
-5. **Respect the format**: All tool calls must still follow the exact \`\`\`jsonl\`\`\` format specified above — each call in its own separate code block. After each tool call, STOP and wait for the result.
-6. **Know when to stop**: Stop the loop when: (a) the user's goal is fully achieved, (b) you have exhausted all reasonable approaches, or (c) the user explicitly asks you to stop. When stopping, always provide a detailed summary.
-7. **Multi-step planning**: At the start of Agent Mode, outline your plan (the steps you intend to take). Update the plan as you learn more from tool results.
-8. **Cross-verify search results**: For search-related tasks, NEVER rely on a single search. Always perform multiple searches with different keywords, phrasings, or angles to cross-verify the information. If the first search result seems incomplete, inaccurate, or lacks detail, immediately try alternative search queries. Compare results from different searches to identify the most accurate and reliable information. Only include information in your final summary that has been confirmed by multiple sources or searches.
-9. **Quality over speed**: Do not rush to conclusions. If the results you have gathered are insufficient, ambiguous, or conflicting, keep searching and investigating until you have high-confidence answers. It is better to make 5 thorough tool calls than to deliver a shallow answer based on 1 call.
-
-### Example Agent Mode Flow
-
-User: "Enter agent mode. Research the latest benchmark scores of GPT-5 and Claude 4."
-
-Response 1: "I'll enter Agent Mode. My plan: 1) Search for GPT-5 benchmarks, 2) Search for Claude 4 benchmarks, 3) Cross-verify with additional searches, 4) Compare and summarize. Let me start with two parallel searches."
-
-\`\`\`jsonl
-{"type": "function_call_start", "name": "web_search", "call_id": 1}
-{"type": "description", "text": "Search for GPT-5 benchmark scores"}
-{"type": "parameter", "key": "query", "value": "GPT-5 benchmark scores MMLU HumanEval"}
-{"type": "function_call_end", "call_id": 1}
-\`\`\`
-
-\`\`\`jsonl
-{"type": "function_call_start", "name": "web_search", "call_id": 2}
-{"type": "description", "text": "Search for Claude 4 benchmark scores"}
-{"type": "parameter", "key": "query", "value": "Claude 4 benchmark scores MMLU HumanEval"}
-{"type": "function_call_end", "call_id": 2}
-\`\`\`
-
-Response 2: "Got initial results but the MMLU scores seem inconsistent across sources. Let me cross-verify with a more specific search."
-
-\`\`\`jsonl
-{"type": "function_call_start", "name": "web_search", "call_id": 3}
-{"type": "description", "text": "Cross-verify GPT-5 MMLU score from official source"}
-{"type": "parameter", "key": "query", "value": "GPT-5 official technical report MMLU score"}
-{"type": "function_call_end", "call_id": 3}
-\`\`\`
-
-Response 3 (final): "Agent Mode complete. After cross-verification across 3 searches, here are the confirmed benchmark scores: [comprehensive comparison table with verified data and source references]"
-
-### Exiting Agent Mode
-
-Agent Mode remains active until: the user says "exit agent mode", "退出agent模式", "stop agent mode", or similar, OR until you have fully completed the task and delivered the final summary. After exiting, return to normal response mode.
-
-## Available Tools
-
-${toolSection}
-</system>
-
-IMPORTANT: Function calls must be placed in a proper \`\`\`jsonl\`\`\` code block exactly as shown above. After outputting a function call, STOP and wait for the result.`;
-
-    return prompt;
-  }
-
-  // ==================== .md 文件附加 ====================
-  function createMCPPromptFile() {
-    const prompt = generateMCPPrompt();
-    // Gemini 仅接受 text/plain，其他平台用 text/markdown
-    const fileMimeType = PLATFORM === 'gemini' ? 'text/plain' : 'text/markdown';
-    return new File([prompt], 'mcp-tools.md', { type: fileMimeType, lastModified: Date.now() });
-  }
-
-  async function attachMCPPromptFile() {
-    if (selectedServers.size === 0) {
-      showNotification('请先在工具栏勾选至少一个 MCP 服务器。');
-      return;
-    }
-
-    const file = createMCPPromptFile();
-
+  // ==================== 通用文件附加（工具定义 .md / Skills，供 sidePanel 指令使用） ====================
+  async function attachFile(file) {
     // Gemini 专用路径：直接走 dragDropListener.js postMessage 机制（Gemini 不支持 fileInput）
     if (PLATFORM === 'gemini') {
       try {
         const success = await geminiDropFile(file);
-        if (success) {
-          showNotification('MCP 提示词文件已通过拖放附加。');
-          return;
-        }
+        if (success) return true;
       } catch (e) {
-        console.warn('[MCP] 提示词文件拖放注入失败:', e);
+        console.warn('[MCP] 文件拖放注入失败:', e);
       }
     }
 
@@ -1827,8 +964,7 @@ IMPORTANT: Function calls must be placed in a proper \`\`\`jsonl\`\`\` code bloc
           fileInput.files = dt.files;
           fileInput.dispatchEvent(new Event('change', { bubbles: true }));
           fileInput.dispatchEvent(new Event('input', { bubbles: true }));
-          showNotification('MCP 提示词文件已通过文件输入附加。');
-          return;
+          return true;
         } catch (e) {
           console.warn('[MCP] 文件输入注入失败:', e);
         }
@@ -1844,8 +980,7 @@ IMPORTANT: Function calls must be placed in a proper \`\`\`jsonl\`\`\` code bloc
         dropZone.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: dt }));
         dropZone.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt }));
         dropZone.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
-        showNotification('MCP 提示词文件已拖放到输入区域。');
-        return;
+        return true;
       } catch (e) {
         console.warn('[MCP] 拖放注入失败:', e);
       }
@@ -1858,61 +993,24 @@ IMPORTANT: Function calls must be placed in a proper \`\`\`jsonl\`\`\` code bloc
         const dt = new DataTransfer();
         dt.items.add(file);
         inputEl.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
-        showNotification('MCP 提示词文件已粘贴到输入区域。');
-        return;
+        return true;
       } catch (e) {
         console.warn('[MCP] 粘贴注入失败:', e);
       }
     }
 
-    // 回退：下载文件
-    downloadMCPPrompt();
-    showNotification('无法自动附加文件，已下载到本地，请手动附加。');
+    return false;
   }
 
-  function downloadMCPPrompt() {
-    if (selectedServers.size === 0) {
-      showNotification('请先在工具栏勾选至少一个 MCP 服务器。');
-      return;
-    }
-
-    const file = createMCPPromptFile();
-    const url = URL.createObjectURL(file);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'mcp-tools.md';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    showNotification('MCP 提示词文件已下载。');
-  }
-
-  async function copyMCPPrompt() {
-    if (selectedServers.size === 0) {
-      showNotification('请先在工具栏勾选至少一个 MCP 服务器。');
-      return;
-    }
-
-    const prompt = generateMCPPrompt();
-    try {
-      await navigator.clipboard.writeText(prompt);
-      showNotification('MCP 提示词已复制到剪贴板。');
-    } catch (e) {
-      const ta = document.createElement('textarea');
-      ta.value = prompt;
-      ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px;';
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      document.body.removeChild(ta);
-      showNotification('MCP 提示词已复制到剪贴板。');
-    }
+  function makeMdFile(fileName, content) {
+    // Gemini 仅接受 text/plain，其他平台用 text/markdown
+    const fileMimeType = PLATFORM === 'gemini' ? 'text/plain' : 'text/markdown';
+    return new File([content], fileName, { type: fileMimeType, lastModified: Date.now() });
   }
 
   // ==================== 平台文件输入 / 拖放区域辅助 ====================
 
-   // Gemini-specific: click the upload button to trigger file input creation, then find it
+  // Gemini-specific: click the upload button to trigger file input creation, then find it
   async function findFileInputWithRetry(maxWait = 3000) {
     // Try existing file input first
     let input = findFileInput();
@@ -2110,7 +1208,7 @@ IMPORTANT: Function calls must be placed in a proper \`\`\`jsonl\`\`\` code bloc
     if (!el) {
       console.warn('[MCP] 找不到输入框元素');
       navigator.clipboard?.writeText(text).then(() => {
-        showNotification('结果已复制到剪贴板（未找到输入框）');
+        console.warn('[MCP] 结果已复制到剪贴板（未找到输入框）');
       });
       return;
     }
@@ -2218,6 +1316,7 @@ IMPORTANT: Function calls must be placed in a proper \`\`\`jsonl\`\`\` code bloc
       }
 
       console.log('[MCP][auto-send] 自动发送完成');
+      reportStatus('auto_sent');
     }, fileParsDelay * 1000);
   }
 
@@ -2281,52 +1380,9 @@ IMPORTANT: Function calls must be placed in a proper \`\`\`jsonl\`\`\` code bloc
     }
   }
 
-  // ==================== 标签页切换 ====================
-  function switchTab(name) {
-    if (!shadowRoot) return;
-    shadowRoot.querySelectorAll('.mcp-tab').forEach((t) => {
-      t.classList.toggle('active', t.dataset.tab === name);
-    });
-    shadowRoot.querySelectorAll('.mcp-tab-content').forEach((c) => c.classList.remove('active'));
-    const map = { tools: 'mcpTabTools', calls: 'mcpTabCalls', skills: 'mcpTabSkills', settings: 'mcpTabSettings' };
-    shadowRoot.querySelector(`#${map[name]}`)?.classList.add('active');
-  }
-
-  // ==================== 通知 ====================
-  function showNotification(msg) {
-    if (!shadowRoot) return;
-    const existing = shadowRoot.querySelector('.mcp-notification');
-    if (existing) existing.remove();
-
-    const notif = document.createElement('div');
-    notif.className = 'mcp-notification';
-    notif.textContent = msg;
-    shadowRoot.querySelector('.mcp-sidebar')?.appendChild(notif);
-    setTimeout(() => notif.remove(), 3000);
-  }
-
-  // ==================== 监听后台广播 ====================
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (msg.type === 'serverStatus') {
-      refreshTools();
-      refreshServers();
-    }
-  });
-
   // ==================== 工具函数 ====================
-  function esc(s) {
-    const d = document.createElement('div');
-    d.textContent = String(s);
-    return d.innerHTML;
-  }
-
   function truncate(s, max) {
     return s.length > max ? s.slice(0, max) + '...' : s;
-  }
-
-  function stringify(v) {
-    if (typeof v === 'string') return v;
-    return JSON.stringify(v);
   }
 
   // ==================== 粘贴拦截：MCP 结果文本 → 文件附件 ====================
@@ -2354,71 +1410,60 @@ IMPORTANT: Function calls must be placed in a proper \`\`\`jsonl\`\`\` code bloc
 
     console.log('[MCP] 检测到 MCP 结果粘贴，转换为文件附件');
 
-    const fileMimeType = PLATFORM === 'gemini' ? 'text/plain' : 'text/markdown';
-    const file = new File([text], `mcp-result-paste-${Date.now()}.md`, {
-      type: fileMimeType,
-      lastModified: Date.now(),
-    });
-
-    // Gemini 专用路径：直接走 dragDropListener.js（Gemini 不支持 fileInput）
-    if (PLATFORM === 'gemini') {
-      try {
-        const success = await geminiDropFile(file);
-        if (success) {
-          showNotification('MCP 结果已作为文件附件注入。');
-          return;
-        }
-      } catch (err) {
-        console.warn('[MCP] 粘贴拦截：拖放注入失败:', err);
+    const file = makeMdFile(`mcp-result-paste-${Date.now()}.md`, text);
+    const ok = await attachFile(file);
+    if (!ok) {
+      // 回退：直接粘贴为文本
+      const inputEl = getInputElement();
+      if (inputEl) {
+        setInputValue(text);
+        console.warn('[MCP] 文件注入失败，已回退为文字粘贴');
       }
-    }
-
-    // 尝试通过文件输入注入（非 Gemini 平台）
-    if (PLATFORM !== 'gemini') {
-      const fileInput = findFileInput();
-      if (fileInput) {
-        try {
-          const dt = new DataTransfer();
-          dt.items.add(file);
-          fileInput.files = dt.files;
-          fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-          fileInput.dispatchEvent(new Event('input', { bubbles: true }));
-          showNotification('MCP 结果已作为文件附件注入。');
-          return;
-        } catch (err) {
-          console.warn('[MCP] 粘贴拦截：文件输入注入失败:', err);
-        }
-      }
-    }
-
-    // 尝试拖放注入
-    const dropZone = getDropZone();
-    if (dropZone) {
-      try {
-        const dt = new DataTransfer();
-        dt.items.add(file);
-        dropZone.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: dt }));
-        dropZone.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt }));
-        dropZone.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
-        showNotification('MCP 结果已作为文件附件拖放注入。');
-        return;
-      } catch (err) {
-        console.warn('[MCP] 粘贴拦截：拖放注入失败:', err);
-      }
-    }
-
-    // 回退：直接粘贴为文本
-    const inputEl = getInputElement();
-    if (inputEl) {
-      setInputValue(text);
-      showNotification('文件注入失败，已回退为文字粘贴。');
     }
   }
+
+  // ==================== sidePanel 指令处理 ====================
+  const CAPS = ['attach']; // 能力声明：attach = 附加文件；compose 将在一步式编排就绪后加入
+
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (!msg || !msg.type) return;
+
+    const handlers = {
+      // 健康检查：sidePanel 用它判断 content script 是否就绪
+      ping: async () => ({ platform: PLATFORM, caps: CAPS }),
+
+      // 附加文件（+ 可选输入文本 + 可选发送）——工具定义 .md / Skills 注入的通用原语
+      attachFileAndText: async ({ fileName, fileContent, text, send: doSend }) => {
+        const file = makeMdFile(fileName || 'attachment.md', fileContent || '');
+        const attached = await attachFile(file);
+        if (!attached) throw new Error('无法附加文件（未找到文件输入/拖放区域）');
+        reportStatus('compose_attached', { detail: fileName });
+        if (text) setInputValue(text);
+        if (doSend) clickSendButtonWithRetry();
+        return { attached: true };
+      },
+
+      // sidePanel 时间线上的「执行/重试」按钮
+      executeCall: async ({ callKey }) => {
+        if (!callRegistry.has(callKey)) throw new Error('调用不存在（可能已切换会话）');
+        executeToolCall(callKey, false);
+        return { started: true };
+      },
+    };
+
+    const handler = handlers[msg.type];
+    if (!handler) return; // 广播类消息（serverStatus 等）不占用响应通道
+
+    handler(msg)
+      .then((data) => sendResponse({ ok: true, data }))
+      .catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true; // 异步响应
+  });
 
   // ==================== 初始化 ====================
   function init() {
     console.log(`[MCP Multi Bridge] 已加载，平台: ${PLATFORM}`);
-    initSidebar();
+    loadSettings();
     startDetection();
 
     // 注册粘贴拦截（capturing 阶段，优先于页面自身处理）
@@ -2427,17 +1472,8 @@ IMPORTANT: Function calls must be placed in a proper \`\`\`jsonl\`\`\` code bloc
     // 初始加载时也设置抑制窗口，防止页面刷新时自动执行历史工具调用
     suppressAutoExecuteUntil = Date.now() + 3000;
 
-    // 延迟自动刷新工具列表，等待服务器连接完成
-    // bindSidebarEvents 中会立即调用一次 refreshTools()，
-    // 但服务器可能还未连接。这里在 3 秒和 8 秒后再次尝试。
-    setTimeout(() => {
-      refreshTools();
-      refreshServers();
-    }, 3000);
-    setTimeout(() => {
-      refreshTools();
-      refreshServers();
-    }, 8000);
+    // Gemini: 预注入拖放监听器到页面主世界（用于文件上传）
+    injectGeminiDragDropListener();
   }
 
   if (document.readyState === 'loading') {

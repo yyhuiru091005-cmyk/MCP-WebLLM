@@ -1,84 +1,65 @@
-/* content.css — Minimal host‐page styles for MCP Multi Bridge */
+/* content.css — 网页内行内状态标（低调版）
+   原悬浮侧边栏样式已删除（UI 迁至 sidePanel），只保留代码块下方的小状态标。 */
 
-#mcp-multi-bridge-host {
-  position: fixed;
-  top: 0;
-  right: 0;
-  width: 320px;
-  height: 100vh;
-  z-index: 2147483647;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-}
-
-#mcp-multi-bridge-toggle {
-  position: fixed;
-  top: 50%;
-  right: 320px;
-  transform: translateY(-50%);
-  z-index: 2147483647;
-  background: #4f46e5;
-  color: #fff;
-  font-size: 11px;
-  font-weight: 700;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  padding: 8px 4px;
-  border-radius: 6px 0 0 6px;
-  cursor: pointer;
-  writing-mode: vertical-rl;
-  text-orientation: mixed;
-  letter-spacing: 1px;
-  user-select: none;
-  box-shadow: -2px 0 8px rgba(0,0,0,.15);
-  transition: right .2s ease;
-}
-
-#mcp-multi-bridge-toggle:hover {
-  background: #4338ca;
-}
-
-#mcp-multi-bridge-toggle.collapsed {
-  right: 0;
-}
-
-/* Inline indicator injected near code blocks */
-.mcp-inline-indicator {
-  display: flex;
+.mcp-chip {
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 12px;
-  margin: 4px 0;
-  background: #eef2ff;
-  border: 1px solid #c7d2fe;
-  border-radius: 6px;
-  font-size: 13px;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-}
-
-.mcp-inline-run {
-  margin-left: auto;
+  gap: 6px;
+  margin: 4px 0 8px;
   padding: 3px 10px;
-  background: #4f46e5;
-  color: #fff;
-  border: none;
-  border-radius: 4px;
+  border-radius: 999px;
   font-size: 12px;
-  font-weight: 600;
+  line-height: 1.5;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: #5d6b80;
+  background: rgba(46, 107, 214, 0.07);
+  border: 1px solid rgba(46, 107, 214, 0.14);
+  user-select: none;
+}
+
+.mcp-chip-icon {
+  font-size: 11px;
+  width: 13px;
+  text-align: center;
+}
+
+.mcp-chip.running .mcp-chip-icon {
+  color: #2e6bd6;
+  display: inline-block;
+  animation: mcp-chip-spin 1.6s linear infinite;
+}
+
+.mcp-chip.done { color: #2e7d4f; background: rgba(46, 158, 91, 0.08); border-color: rgba(46, 158, 91, 0.18); }
+.mcp-chip.error { color: #b04537; background: rgba(192, 57, 43, 0.07); border-color: rgba(192, 57, 43, 0.18); }
+
+.mcp-chip-btn {
+  border: 1px solid rgba(46, 107, 214, 0.35);
+  background: transparent;
+  color: #2e6bd6;
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 999px;
   cursor: pointer;
+  margin-left: 2px;
 }
 
-.mcp-inline-run:hover {
-  background: #4338ca;
+.mcp-chip-btn:hover { background: rgba(46, 107, 214, 0.10); }
+
+@keyframes mcp-chip-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
-.mcp-inline-run:disabled {
-  opacity: .6;
-  cursor: default;
-}
-
-.mcp-inline-run.done {
-  background: #16a34a;
-}
-
-.mcp-inline-run.error {
-  background: #dc2626;
+/* 深色页面（ChatGPT/Gemini 等自带深色主题时跟随系统） */
+@media (prefers-color-scheme: dark) {
+  .mcp-chip {
+    color: #93a1b5;
+    background: rgba(110, 161, 255, 0.10);
+    border-color: rgba(110, 161, 255, 0.18);
+  }
+  .mcp-chip.running .mcp-chip-icon { color: #6ea1ff; }
+  .mcp-chip.done { color: #63c68d; background: rgba(77, 189, 127, 0.10); border-color: rgba(77, 189, 127, 0.22); }
+  .mcp-chip.error { color: #e08a7d; background: rgba(224, 112, 96, 0.10); border-color: rgba(224, 112, 96, 0.22); }
+  .mcp-chip-btn { color: #6ea1ff; border-color: rgba(110, 161, 255, 0.40); }
+  .mcp-chip-btn:hover { background: rgba(110, 161, 255, 0.12); }
 }
