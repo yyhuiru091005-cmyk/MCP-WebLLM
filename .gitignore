@@ -9,6 +9,9 @@ yarn-error.log*
 .DS_Store
 Thumbs.db
 
+# 本机 native messaging host 包装脚本（含本地绝对路径，因人而异，勿提交）
+native-host.sh
+
 # Editors
 .vscode/
 .idea/

@@ -1,5 +1,17 @@
 # MCP Multi Bridge
 
+> **Fork 说明**：本项目基于 [luskB/MCP-WebLLM](https://github.com/luskB/MCP-WebLLM) 修改，原作者 **Jiabao Shang**，遵循 [MIT 许可](./LICENSE)（原 LICENSE 与版权声明保留不变）。感谢原作者的出色工作。
+>
+> 本 fork 的主要改动：
+> - **嵌入式 sidePanel 重构**：悬浮注入框改为 Chrome 官方 `sidePanel` 侧边栏，UI 全部迁入；content script 瘦身为只负责网页操作的"手"（注入、检测、执行、回注）
+> - **一步式工具调用**：侧边栏内置输入框，自动完成"附加工具定义 + 提问 + 发送"，不再需要每个对话手动附加 .md（对话级注入标记，同一对话不重复注入）
+> - **调用状态可视化**：侧边栏实时时间线 + 网页内低调行内状态标（检测到 → 调用中 → 已完成）
+> - **结果消息中文化**：自动回注的结果消息改为简短中文，不再是突兀英文
+> - **蓝色融合风 UI**：低饱和蓝、圆角面板、留白与轻投影，跟随系统明暗
+> - 更新扩展图标
+>
+> MCP 连接层（SSE / Streamable HTTP / stdio native host）、检测→执行→注入核心管线均保留原实现。
+
 <div align="center">
   <h3>将本地 MCP 服务器无缝接入各大网页版 AI 助手的浏览器扩展</h3>
   <p>
