@@ -21,6 +21,7 @@
     <img src="https://img.shields.io/badge/License-MIT-lightgrey" alt="MIT License" />
   </p>
   <p><b>本项目由 OPENCODE + Claude Opus 4.6 完成</b></p>
+  <p><b>本 fork 的改造由 Claude Fable 5（Cowork）+ Claude Opus 4.8 协作完成</b></p>
 </div>
 
 ---
