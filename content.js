@@ -726,9 +726,9 @@
       }).join('\n\n');
 
       if (hasErrors) {
-        setInputValue(`MCP tool calls [${toolNames}] encountered errors. Please analyze and retry:\n\n${combinedBlocks}`);
+        setInputValue(`[工具结果] ${toolNames} 调用出错，请分析错误、修正参数后重试：\n\n${combinedBlocks}`);
       } else {
-        setInputValue(`Here are the results of the MCP tool calls [${toolNames}]:\n\n${combinedBlocks}`);
+        setInputValue(`[工具结果] ${toolNames} 已执行完毕，结果如下，请继续：\n\n${combinedBlocks}`);
       }
 
       reportStatus('results_injected', { detail: toolNames });
@@ -841,11 +841,11 @@
 
     if (attached) {
       if (hasErrors && hasSuccesses) {
-        setInputValue(`The results of MCP tools [${toolNames}] are attached as a .md file. Some tools returned errors. Please read the attachment, analyze the errors, fix the parameters, and retry the failed tools.`);
+        setInputValue(`[工具结果] ${toolNames} 的结果见附件，其中部分调用出错；请阅读附件，分析错误、修正参数后重试失败的调用。`);
       } else if (hasErrors) {
-        setInputValue(`MCP tool calls [${toolNames}] returned errors. The error details are attached as a .md file. Please read the attachment, analyze the errors, fix the parameters, and retry.`);
+        setInputValue(`[工具结果] ${toolNames} 调用出错，详情见附件；请阅读附件，分析错误、修正参数后重试。`);
       } else {
-        setInputValue(`The results of MCP tools [${toolNames}] are attached as a .md file. Please read the attachment and continue.`);
+        setInputValue(`[工具结果] ${toolNames} 的结果见附件，请阅读后继续。`);
       }
     } else {
       // 回退：合并文本直接粘贴
@@ -863,9 +863,9 @@
       }).join('\n\n');
 
       if (hasErrors) {
-        setInputValue(`MCP tool calls [${toolNames}] encountered errors. Please analyze and retry:\n\n${combinedBlocks}`);
+        setInputValue(`[工具结果] ${toolNames} 调用出错，请分析错误、修正参数后重试：\n\n${combinedBlocks}`);
       } else {
-        setInputValue(`Here are the results of the MCP tool calls [${toolNames}]:\n\n${combinedBlocks}`);
+        setInputValue(`[工具结果] ${toolNames} 已执行完毕，结果如下，请继续：\n\n${combinedBlocks}`);
       }
     }
 
@@ -910,7 +910,7 @@
     // 粘贴拦截关闭时，直接以纯文本注入，不创建 .md 文件
     if (!pasteIntercept) {
       console.log('[MCP] pasteIntercept=OFF, 直接以纯文本注入结果');
-      const fullText = `Here is the result of the MCP tool call "${call.name}":\n\n${block}`;
+      const fullText = `[工具结果] ${call.name} 已执行完毕，结果如下，请继续：\n\n${block}`;
       setInputValue(fullText);
       reportStatus('results_injected', { detail: call.name });
       return;
@@ -981,11 +981,11 @@
     }
 
     if (attached) {
-      // 在输入框留一条简短提示（AI 可读）
-      setInputValue(`The result of MCP tool "${call.name}" is attached as a .md file. Please read the attachment and continue.`);
+      // 在输入框留一条简短提示（中文、低调，AI 可读）
+      setInputValue(`[工具结果] ${call.name} 的结果见附件，请阅读后继续。`);
     } else {
       // 回退：直接粘贴完整结果
-      const fullText = `Here is the result of the MCP tool call "${call.name}":\n\n${block}`;
+      const fullText = `[工具结果] ${call.name} 已执行完毕，结果如下，请继续：\n\n${block}`;
       setInputValue(fullText);
     }
     reportStatus('results_injected', { detail: call.name });
