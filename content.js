@@ -225,7 +225,57 @@
     }
   }
 
+  // ==================== 对话级"已注入工具定义"标记 ====================
+  // 关键坑：新对话发出第一条消息前 URL 是根路径（如 chatgpt.com/），
+  // 发送后平台跳到 /c/<id>。若不迁移标记，会把"URL 定型"误判为切换会话，
+  // 导致下一问重复注入工具定义。
+  // 解法：compose 附加工具定义后开一个 30 秒迁移窗口；窗口内的首次 URL 变化
+  // 视为同一对话定型 → 把标记从旧 URL 迁到新 URL，且不做会话重置。
+  const CONV_MIGRATION_WINDOW = 30000; // ms
+  let pendingConvMigration = 0;  // 时间戳；0 = 无待迁移
+  let pendingConvMigrationFrom = ''; // compose 时的对话 key
+
+  function getConversationKey() {
+    return location.origin + location.pathname; // 忽略 query/hash
+  }
+
+  function getInjectedConvs() {
+    try {
+      return JSON.parse(sessionStorage.getItem('mcpInjectedConvs') || '[]');
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function isConvInjected(key) {
+    return getInjectedConvs().includes(key);
+  }
+
+  function markConvInjected(key) {
+    const list = getInjectedConvs();
+    if (!list.includes(key)) {
+      list.push(key);
+      try { sessionStorage.setItem('mcpInjectedConvs', JSON.stringify(list.slice(-50))); } catch (_) { }
+    }
+  }
+
+  function unmarkConvInjected(key) {
+    const list = getInjectedConvs().filter((k) => k !== key);
+    try { sessionStorage.setItem('mcpInjectedConvs', JSON.stringify(list)); } catch (_) { }
+  }
+
   function onConversationSwitch() {
+    // 迁移窗口内的首次 URL 变化：同一对话 URL 定型，迁移标记，不重置状态
+    if (pendingConvMigration && Date.now() - pendingConvMigration < CONV_MIGRATION_WINDOW) {
+      pendingConvMigration = 0;
+      const newKey = getConversationKey();
+      unmarkConvInjected(pendingConvMigrationFrom); // 根 URL 的标记必须摘掉，否则下一个新对话会漏注入
+      markConvInjected(newKey);
+      console.log('[MCP] 对话 URL 定型，注入标记已迁移 →', newKey);
+      return;
+    }
+    pendingConvMigration = 0;
+
     console.log('[MCP] 检测到会话切换，暂停自动执行 3 秒');
     // 设置 3 秒抑制窗口：在此期间扫描到的工具调用不自动执行
     suppressAutoExecuteUntil = Date.now() + 3000;
@@ -1274,10 +1324,11 @@
     el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
   }
 
-  function clickSendButtonWithRetry() {
+  // delaySec: 发送前延迟（默认等平台解析文件）；doneEvent: 发送完成后广播的事件名
+  function clickSendButtonWithRetry(delaySec = fileParsDelay, doneEvent = 'auto_sent') {
     // 取消之前的发送定时器（防止重复发送）
     clearTimeout(sendRetryTimer);
-    console.log(`[MCP][auto-send] clickSendButtonWithRetry: scheduling ${fileParsDelay}s delay send (等待平台解析文件)`);
+    console.log(`[MCP][auto-send] clickSendButtonWithRetry: scheduling ${delaySec}s delay send (等待平台解析文件)`);
     // 等待平台解析上传的文件（大模型解析文件一般需要数秒，用户可在设置中调整）
     sendRetryTimer = setTimeout(() => {
       sendRetryTimer = null;
@@ -1316,8 +1367,8 @@
       }
 
       console.log('[MCP][auto-send] 自动发送完成');
-      reportStatus('auto_sent');
-    }, fileParsDelay * 1000);
+      reportStatus(doneEvent);
+    }, delaySec * 1000);
   }
 
   function findSendButton() {
@@ -1423,7 +1474,7 @@
   }
 
   // ==================== sidePanel 指令处理 ====================
-  const CAPS = ['attach']; // 能力声明：attach = 附加文件；compose 将在一步式编排就绪后加入
+  const CAPS = ['attach', 'compose']; // 能力声明：attach = 附加文件；compose = 一步式编排
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || !msg.type) return;
@@ -1441,6 +1492,29 @@
         if (text) setInputValue(text);
         if (doSend) clickSendButtonWithRetry();
         return { attached: true };
+      },
+
+      // 一步式编排：「(按需)附加工具定义 + 注入提问 + 发送」，用户感知只有一步
+      composeAndSend: async ({ question, toolsMd }) => {
+        if (!question) throw new Error('提问内容为空');
+        const convKey = getConversationKey();
+        const needTools = !!toolsMd && !isConvInjected(convKey);
+
+        if (needTools) {
+          const file = makeMdFile('mcp-tools.md', toolsMd);
+          const ok = await attachFile(file);
+          if (!ok) throw new Error('无法附加工具定义文件（未找到文件输入/拖放区域）');
+          markConvInjected(convKey);
+          // 开迁移窗口：新对话发送后 URL 会从根路径定型为 /c/<id>
+          pendingConvMigration = Date.now();
+          pendingConvMigrationFrom = convKey;
+          reportStatus('compose_attached', { detail: 'mcp-tools.md' });
+        }
+
+        setInputValue(question);
+        // 带附件时等平台解析（fileParsDelay）；纯文本提问只留 0.5s 让输入事件落定
+        clickSendButtonWithRetry(needTools ? fileParsDelay : 0.5, 'question_sent');
+        return { injectedTools: needTools };
       },
 
       // sidePanel 时间线上的「执行/重试」按钮

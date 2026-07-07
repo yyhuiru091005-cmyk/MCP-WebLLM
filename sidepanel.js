@@ -716,7 +716,7 @@ async function composeAndSend() {
       key: `compose-${Date.now()}`,
       icon: '✓',
       cls: 'done',
-      title: result?.injectedTools ? '已带工具定义发送提问' : '已发送提问（本对话已有工具定义）',
+      title: result?.injectedTools ? '已受理：附加工具定义 + 提问，稍后自动发送' : '已受理：本对话已有工具定义，直接提问',
       detail: truncate(question, 80),
     });
   } catch (e) {
