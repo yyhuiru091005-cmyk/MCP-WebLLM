@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MCP Multi Bridge</title>
+  <link rel="stylesheet" href="sidepanel.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="app-header">
+      <span class="app-title">MCP Bridge</span>
+      <span class="server-count" id="serverCount">0/0 已连接</span>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="chat">对话</button>
+      <button class="tab" data-tab="tools">工具</button>
+      <button class="tab" data-tab="skills">Skills</button>
+      <button class="tab" data-tab="servers">服务器</button>
+      <button class="tab" data-tab="settings">设置</button>
+    </nav>
+
+    <main class="main">
+      <!-- ============ 对话 ============ -->
+      <section class="tab-panel active" id="tab-chat">
+        <div class="card page-status" id="pageStatus">
+          <span class="dot" id="pageStatusDot"></span>
+          <span id="pageStatusText">正在检测当前页面…</span>
+        </div>
+        <div class="card timeline-card">
+          <div class="timeline" id="timeline">
+            <div class="empty">在下方输入需求，我会自动带上工具定义发给当前 AI 页面。<br/>工具调用的执行进度会显示在这里。</div>
+          </div>
+        </div>
+        <div class="card composer">
+          <textarea id="chatInput" rows="3" placeholder="向当前 AI 页面提问…" disabled></textarea>
+          <div class="composer-bar">
+            <span class="composer-hint" id="composerHint"></span>
+            <button class="btn btn-primary" id="sendBtn" disabled>发送</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 工具 ============ -->
+      <section class="tab-panel" id="tab-tools">
+        <div class="card">
+          <div class="row">
+            <button class="btn" id="refreshToolsBtn">刷新</button>
+            <button class="btn" id="selectAllBtn">全选</button>
+            <button class="btn" id="clearSelBtn">清除</button>
+            <button class="btn" id="attachMdBtn" title="手动附加工具定义到当前 AI 页面（备用）">手动附加</button>
+          </div>
+          <div class="tool-list" id="toolList">
+            <div class="empty">暂无可用工具。请在「服务器」页添加 MCP 服务器。</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ Skills ============ -->
+      <section class="tab-panel" id="tab-skills">
+        <div class="card">
+          <div class="row">
+            <button class="btn btn-primary" id="importSkillBtn">导入文件夹</button>
+            <button class="btn" id="injectSkillsBtn">注入选中</button>
+            <button class="btn btn-danger" id="deleteSkillBtn">删除</button>
+          </div>
+          <input type="file" id="skillFolderInput" webkitdirectory multiple style="display:none" />
+          <div class="skill-list" id="skillList">
+            <div class="empty">暂无 Skills。点击上方按钮导入文件夹。</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 服务器 ============ -->
+      <section class="tab-panel" id="tab-servers">
+        <div class="card">
+          <form id="addForm">
+            <div class="form-row">
+              <label>名称</label>
+              <input type="text" id="serverName" placeholder="my-server" required />
+            </div>
+            <div class="form-row">
+              <label>传输</label>
+              <select id="serverTransport">
+                <option value="sse">SSE</option>
+                <option value="streamable-http">Streamable HTTP</option>
+                <option value="stdio">stdio (native host)</option>
+              </select>
+            </div>
+            <div class="form-row" id="urlRow">
+              <label>URL</label>
+              <input type="text" id="serverUrl" placeholder="http://localhost:3006/sse" />
+            </div>
+            <div class="form-row" id="commandRow" style="display:none">
+              <label>Command</label>
+              <input type="text" id="serverCommand" placeholder="npx" />
+            </div>
+            <div class="form-row" id="argsRow" style="display:none">
+              <label>Args</label>
+              <input type="text" id="serverArgs" placeholder="-y @modelcontextprotocol/server-filesystem ~" />
+            </div>
+            <button class="btn btn-primary btn-full" type="submit">添加服务器</button>
+          </form>
+        </div>
+        <div class="server-list" id="serverList">
+          <div class="empty">尚未配置服务器。</div>
+        </div>
+      </section>
+
+      <!-- ============ 设置 ============ -->
+      <section class="tab-panel" id="tab-settings">
+        <div class="card">
+          <label class="toggle-row">
+            <input type="checkbox" id="setAutoExecute" />
+            <span>自动执行工具调用</span>
+          </label>
+          <label class="toggle-row">
+            <input type="checkbox" id="setAutoSubmit" />
+            <span>注入结果后自动发送</span>
+          </label>
+          <label class="toggle-row">
+            <input type="checkbox" id="setPasteIntercept" />
+            <span>粘贴拦截（MCP 结果 → 文件附件）</span>
+          </label>
+          <div class="delay-row">
+            <label for="setAutoSendDelay">等待注入延迟</label>
+            <div class="delay-input"><input type="number" id="setAutoSendDelay" min="1" max="30" /><span>秒</span></div>
+            <span class="hint">最后一个调用完成后等待新调用的时间</span>
+          </div>
+          <div class="delay-row">
+            <label for="setFileParsDelay">发送前延迟</label>
+            <div class="delay-input"><input type="number" id="setFileParsDelay" min="1" max="30" /><span>秒</span></div>
+            <span class="hint">注入文件后等待平台解析再发送</span>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <div class="toast" id="toast"></div>
+  <script src="sidepanel.js"></script>
+</body>
+</html>

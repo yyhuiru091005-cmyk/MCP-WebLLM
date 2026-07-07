@@ -575,6 +575,11 @@ async function handleMessage(msg) {
       return await conn.callTool(msg.toolName, msg.arguments || {});
     }
 
+    // ---- 状态广播（content → sidePanel），background 不处理，仅避免报"未知消息" ----
+    case 'mcpStatus': {
+      return true;
+    }
+
     default:
       throw new Error(`Unknown message type: ${msg.type}`);
   }
@@ -587,6 +592,15 @@ chrome.runtime.onConnect.addListener((port) => {
     port.onDisconnect.addListener(() => { });
   }
 });
+
+// ===================== Side Panel =====================
+// 点击工具栏图标 → 打开/关闭侧边栏（取代原 popup）
+try {
+  chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })
+    .catch((e) => console.warn('[MCP] setPanelBehavior failed:', e));
+} catch (e) {
+  console.warn('[MCP] sidePanel API unavailable:', e);
+}
 
 // ===================== Init =====================
 manager.init();
